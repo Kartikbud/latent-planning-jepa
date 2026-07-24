@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import numpy as np
+import heapq
 
 """
 This is where the latent space planner is implemented.
@@ -21,7 +22,8 @@ class Planner():
                  H : int = 5, # planning horizon
                  N : int = 300, # number of samples per iteration
                  K : int = 30, # number of elites per iteration
-                 T : int = 30): # number of iterations
+                 T : int = 30,
+                 action_dim : int = 7): # number of iterations
         
         self.enc = enc
         self.pred = pred
@@ -29,30 +31,42 @@ class Planner():
         self.N = N
         self.K = K
         self.T = T
+        self.action_dim = action_dim
 
+    @torch.no_grad()
     def CEM(self, zi, zg): 
         # zi shape: (window, embedding dim)
 
-        current = zi[-1]
-
-        mean = np.zeros(7) 
-        covariance = np.eye(7) # identity matrix
+        mean = np.zeros((self.H, self.action_dim))
+        std = np.ones((self.H, self.action_dim)) # identity matrix
 
         sampler = np.random.default_rng()
 
         for i in range(self.T):
             action_samples = []
-            costs = []
+            heapq.heapify(action_samples)
             
-            for i in range(self.N): # sampling and then rolling out the actions using the model
-                actions = sampler.multivariate_normal(mean, covariance, size=self.H)
-                action_samples.append(torch.from_numpy(actions))
-                window = zi
+            for i in range(self.N): # sampling and then rolling out the actions using the model for N iterations
+                actions = sampler.normal(mean, std)
+                # predictor expects batch dimension so I need to unsqueeze
+                actions = torch.from_numpy(actions)
+                window = zi.unsqueeze(0)
                 for j in range(self.H):
-                    emb = self.enc(window)                 
-                    pred = self.pred(emb, actions[j])[-1] # only taking the last one so shape is (192,)
-                    window = torch.cat(window[1:], pred.unsqueeze(0), dim=1) # pred becomes (1, 192) and then is concatenated with the window but pops first emb
-                costs.append(nn.MSELoss(window[-1], zg))
+                    # emb = self.enc(window)                 
+                    pred = self.pred(window, actions[j]).squeeze(0)[-1] # only taking the last one so shape is (192,)
+                    window = torch.cat(window[1:], pred.unsqueeze(0), dim=0) # pred becomes (1, 192) and then is concatenated with the window but pops first emb
+                heapq.heappush(action_samples, (nn.functional.mse_loss(window[-1], zg).item(), i, actions.numpy()))
+            k_lowest_tuples = heapq.nsmallest(self.K, action_samples)
+            k_lowest = np.stack([action for cost, idx, action in k_lowest_tuples]) # ndarray of shape (K, H, action_dim)
+
+            mean = np.mean(k_lowest, axis=0)
+            std = np.std(k_lowest, axis=0) + 1e-6 # the small term is added to avoid std collapse
+        
+        return sampler.normal(mean, std)
+
+
+            
+
 
                     
 
