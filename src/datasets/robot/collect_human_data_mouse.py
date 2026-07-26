@@ -105,7 +105,7 @@ def make_env():
     }
 
 
-def collect_episode(env, device):
+def collect_episode(env, device, record=True):
     """Run one teleop episode. Returns (states, actions, frames, success)."""
     env.reset()
     set_geom_groups(env, collision=False, visual=True)
@@ -114,14 +114,15 @@ def collect_episode(env, device):
     env.render()
     device.start_control()
 
-    states = [np.array(env.sim.get_state().flatten())]
+    states = [np.array(env.sim.get_state().flatten())] if record else []
     actions = []
     frames = []
     hold = -1
     gripper_closed = False
     prev_held = False
+    steps = 0
 
-    while len(actions) < MAX_STEPS:
+    while steps < MAX_STEPS:
         action, _ = input2action(device=device, robot=env.robots[0], active_arm="right")
         if action is None:  # right button reset
             break
@@ -140,16 +141,18 @@ def collect_episode(env, device):
         action[-1] = 1.0 if gripper_closed else -1.0
 
         env.step(action)
+        steps += 1
 
         # live window: show EE guide
         show_ee_guide(env)
         env.render()
 
-        # review / data path: hide overlays first so they are not recorded
-        hide_overlays(env)
-        actions.append(np.array(action))
-        states.append(np.array(env.sim.get_state().flatten()))
-        frames.append(np.array(env.sim.render(height=256, width=256, camera_name=CAMERA)))
+        if record:
+            # review / data path: hide overlays first so they are not recorded
+            hide_overlays(env)
+            actions.append(np.array(action))
+            states.append(np.array(env.sim.get_state().flatten()))
+            frames.append(np.array(env.sim.render(height=256, width=256, camera_name=CAMERA)))
 
         if env._check_success():
             if hold > 0:
@@ -162,13 +165,13 @@ def collect_episode(env, device):
             hold = -1
 
     # drop trailing state (robosuite convention: one state after last action)
-    if len(states) == len(actions) + 1:
+    if record and len(states) == len(actions) + 1:
         states = states[:-1]
 
     # ensure saved model_file has sites hidden
     hide_overlays(env)
 
-    success = env._check_success() and len(actions) < MAX_STEPS and len(actions) > 0
+    success = env._check_success() and steps < MAX_STEPS and steps > 0
     return states, actions, frames, success
 
 
@@ -262,12 +265,12 @@ def main():
     )
     parser.add_argument("--pos_sensitivity", type=float, default=1.0)
     parser.add_argument("--rot_sensitivity", type=float, default=1.0)
+    parser.add_argument(
+        "--fun",
+        action="store_true",
+        help="Practice teleop only — no recording, review, or saving.",
+    )
     args = parser.parse_args()
-
-    existing = count_existing_demos(SAVE_DIR)
-    if existing >= args.num_episodes:
-        print(f"Already have {existing} demos in {SAVE_DIR} (target {args.num_episodes}). Nothing to do.")
-        return
 
     env, env_info = make_env()
     device = SpaceMouse(
@@ -275,17 +278,37 @@ def main():
         rot_sensitivity=args.rot_sensitivity,
     )
 
-    print(f"Resuming Stack collection → {SAVE_DIR}")
-    print(f"Already have {existing}/{args.num_episodes}; need {args.num_episodes - existing} more.")
-    print(f"SpaceMouse teleop. Right button aborts an episode. Success must be < {MAX_STEPS} steps.")
+    print(f"SpaceMouse teleop. Right button aborts / resets. Success held for {SUCCESS_HOLD} steps ends episode.")
     print("Left button click toggles gripper. Roll/pitch disabled — yaw + XYZ only.")
     print("Task: pick cubeA and place it on cubeB.")
+
+    if args.fun:
+        print("\nFUN MODE — nothing will be saved. Ctrl+C to quit.")
+        try:
+            while True:
+                print("\n=== Practice trial (right button to reset) ===")
+                _, _, _, success = collect_episode(env, device, record=False)
+                print("Success!" if success else "Reset / incomplete. New randomization.")
+        except KeyboardInterrupt:
+            print("\nDone (fun mode).")
+        finally:
+            env.close()
+        return
+
+    existing = count_existing_demos(SAVE_DIR)
+    if existing >= args.num_episodes:
+        print(f"Already have {existing} demos in {SAVE_DIR} (target {args.num_episodes}). Nothing to do.")
+        env.close()
+        return
+
+    print(f"Resuming Stack collection → {SAVE_DIR}")
+    print(f"Already have {existing}/{args.num_episodes}; need {args.num_episodes - existing} more.")
 
     saved = existing
     try:
         while saved < args.num_episodes:
             print(f"\n=== Trial for demo {saved + 1}/{args.num_episodes} ===")
-            states, actions, frames, success = collect_episode(env, device)
+            states, actions, frames, success = collect_episode(env, device, record=True)
             model_xml = env.sim.model.get_xml()
 
             if not success:
