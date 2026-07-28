@@ -26,29 +26,29 @@ class Planner():
                  T : int = 30, # number of iterations
                  action_dim : int = 7): # number of iterations
         
-        self.enc = enc.to(device)
-        self.pred = pred.to(device)
+        self.device = torch.device(device)
+        self.enc = enc.to(self.device)
+        self.pred = pred.to(self.device)
         self.H = H
         self.N = N
         self.K = K
         self.T = T
         self.action_dim = action_dim
-        self.device = device
 
     @torch.no_grad()
     def CEM(self, zi, a, zg): 
         # zi shape: (window, embedding dim)
         # a shape: (window - 1, a_dim) it doesnt contain a_t but contains the rest
 
-        zi = zi.to(self.device)
-        a = a.to(self.device)
-        zg = zg.to(self.device)
+        zi = zi.to(self.device, dtype=torch.float32)
+        a = a.to(self.device, dtype=torch.float32)
+        zg = zg.to(self.device, dtype=torch.float32)
 
         self.pred.eval()
         self.enc.eval()
 
-        mean = np.zeros((self.H, self.action_dim))
-        std = np.ones((self.H, self.action_dim)) 
+        mean = np.zeros((self.H, self.action_dim), dtype=np.float32)
+        std = np.ones((self.H, self.action_dim), dtype=np.float32)
 
         sampler = np.random.default_rng()
 
@@ -58,10 +58,10 @@ class Planner():
             
             for i in range(self.N): # sampling and then rolling out the actions using the model for N iterations
                 actions = sampler.normal(mean, std)
-                # predictor expects batch dimension so I need to unsqueeze
+                # predictor expects batch dimension; keep feedforward tensors on self.device
                 actions = torch.as_tensor(
                     actions,
-                    dtype=zi.dtype,
+                    dtype=torch.float32,
                     device=self.device,
                 )
 
@@ -88,7 +88,7 @@ class Planner():
             mean = np.mean(k_lowest, axis=0)
             std = np.std(k_lowest, axis=0) + 1e-6 # the small term is added to avoid std collapse
         
-        return sampler.normal(mean, std) # NEED TO FIGURE OUT WHAT TO RETURN HERE
+        return mean[0]
 
 
             
