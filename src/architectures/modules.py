@@ -1,127 +1,154 @@
-from torch import nn
 import torch
-import math
+import torch.nn.functional as F
+from torch import nn
 
-"""
-This is where the individual components of the networks are defined,
-more specifically the Attention Heads and MLPs that come together to
-make transformers
-"""
 
-class TransformerBlock(nn.Module): # pre norm transformer implementation with adaptive layer norm as an option
-    def __init__(self, 
-                d_model : int = 192,
-                nheads : int = 16,
-                d_action : int = None,
-                dropout : float = 0.1,
-                causal_masking : bool = True,
-                adaptive : bool = True):
+class ProjectionMLP(nn.Module):
+    """LeWM projection head used after encoder and predictor features."""
+
+    def __init__(self, input_dim: int = 192, hidden_dim: int = 2048, output_dim: int = 192):
         super().__init__()
-
-        self.d_model = d_model
-        self.nheads = nheads
-        self.d_action = d_action
-        self.hidden_dim = 4 * self.d_model
-        self.dropout = dropout
-        self.adaptive = adaptive
-        
-        if self.adaptive:
-            self.W_LNparams = nn.Linear(in_features=d_action, out_features=4*d_model) # 2 sets of parameters for each norm
-            # initing the weights and bias to 0
-            self.W_LNparams.weight.data.zero_()
-            self.W_LNparams.bias.data.zero_()
-            self.norm = nn.LayerNorm(self.d_model, elementwise_affine=False)
-        else:
-            self.norm = nn.LayerNorm(self.d_model, elementwise_affine=True)
-
-        self.attn_block = MultiHeadAttention(d_model=d_model,
-                                             nheads=nheads,
-                                             dropout=self.dropout,
-                                             causal_masking=causal_masking)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_features=self.d_model, out_features=self.hidden_dim),
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(in_features=self.hidden_dim, out_features=self.d_model),
-            nn.Dropout(self.dropout)
-        )                                        
+            nn.Linear(hidden_dim, output_dim),
+        )
 
-    def forward(self, z, a=None): # positional embeddings should come into this
-        # Note: can also add gates to make training more stable if need be
-        if self.adaptive:
-            params = self.W_LNparams(a)
-            scale_one, shift_one, scale_two, shift_two = params.chunk(4, dim=-1) # splitting the tensor into 2 seperate tensors for each param
-            residual_one = self.attn_block((1 + scale_one) * self.norm(z) + shift_one)
-        else:
-            residual_one = self.attn_block(self.norm(z))
-        z = z + residual_one
-        
-        if self.adaptive:
-            residual_two = self.mlp((1 + scale_two) * self.norm(z) + shift_two)
-        else:
-            residual_two = self.mlp(self.norm(z))
-        z = z + residual_two
+    def forward(self, x):
+        return self.layers(x)
 
+
+class ActionEncoder(nn.Module):
+    """Encode one ordered primitive-action block for AdaLN conditioning."""
+
+    def __init__(self, input_dim: int, smoothed_dim: int = 10, embedding_dim: int = 192):
+        super().__init__()
+        self.smoother = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1)
+        self.mlp = nn.Sequential(
+            nn.Linear(smoothed_dim, 4 * embedding_dim),
+            nn.SiLU(),
+            nn.Linear(4 * embedding_dim, embedding_dim),
+        )
+
+    def forward(self, actions):
+        batch_size, sequence_length, _ = actions.shape
+        actions = self.smoother(actions.transpose(1, 2)).transpose(1, 2)
+        return self.mlp(actions.reshape(batch_size * sequence_length, -1)).reshape(
+            batch_size, sequence_length, -1
+        )
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm transformer block with optional AdaLN-Zero conditioning."""
+
+    def __init__(
+        self,
+        d_model: int = 192,
+        nheads: int = 16,
+        d_action: int | None = None,
+        dropout: float = 0.1,
+        causal_masking: bool = True,
+        adaptive: bool = True,
+        dim_head: int | None = None,
+        mlp_dim: int | None = None,
+    ):
+        super().__init__()
+        self.adaptive = adaptive
+        hidden_dim = mlp_dim or 4 * d_model
+
+        self.norm_one = nn.LayerNorm(d_model, elementwise_affine=not adaptive)
+        self.norm_two = nn.LayerNorm(d_model, elementwise_affine=not adaptive)
+        if adaptive:
+            if d_action is None:
+                raise ValueError("d_action is required for an adaptive transformer block")
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(d_action, 6 * d_model),
+            )
+            nn.init.zeros_(self.adaLN_modulation[-1].weight)
+            nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+        self.attn_block = MultiHeadAttention(
+            d_model=d_model,
+            nheads=nheads,
+            dim_head=dim_head,
+            dropout=dropout,
+            causal_masking=causal_masking,
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    @staticmethod
+    def _modulate(x, shift, scale):
+        return x * (1 + scale) + shift
+
+    def forward(self, z, a=None):
+        if self.adaptive:
+            if a is None:
+                raise ValueError("action conditioning is required for an adaptive block")
+            shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
+                self.adaLN_modulation(a).chunk(6, dim=-1)
+            )
+            z = z + gate_attn * self.attn_block(
+                self._modulate(self.norm_one(z), shift_attn, scale_attn)
+            )
+            z = z + gate_mlp * self.mlp(
+                self._modulate(self.norm_two(z), shift_mlp, scale_mlp)
+            )
+        else:
+            z = z + self.attn_block(self.norm_one(z))
+            z = z + self.mlp(self.norm_two(z))
         return z
 
 
-# shape of the input embeddings: (B, N, d_model)
-class MultiHeadAttention(nn.Module): # implemented with causal masking
-    def __init__(self, 
-                d_model : int = 192, 
-                nheads : int = 16,
-                dropout : float = 0.1,
-                causal_masking : bool = True):
-
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int = 192,
+        nheads: int = 16,
+        dim_head: int | None = None,
+        dropout: float = 0.1,
+        causal_masking: bool = True,
+    ):
         super().__init__()
-        self.d_model = d_model
         self.dropout = dropout
-        self.d_k = self.d_model // nheads
-        self.H = nheads
+        self.d_k = dim_head or (d_model // nheads)
+        self.nheads = nheads
+        self.inner_dim = self.nheads * self.d_k
         self.causal_masking = causal_masking
 
-        self.drop = nn.Dropout(p=self.dropout)
+        self.W_q = nn.Linear(d_model, self.inner_dim)
+        self.W_k = nn.Linear(d_model, self.inner_dim)
+        self.W_v = nn.Linear(d_model, self.inner_dim)
+        self.W_o = nn.Linear(self.inner_dim, d_model)
+        self.drop = nn.Dropout(dropout)
 
-        # Q V K projection weights
-        self.W_q = nn.Linear(in_features=d_model, out_features=d_model)
-        self.W_k = nn.Linear(in_features=d_model, out_features=d_model)
-        self.W_v = nn.Linear(in_features=d_model, out_features=d_model)
-        
-        #output layer
-        self.W_o = nn.Linear(in_features=d_model, out_features=d_model)
+    def forward(self, x):
+        batch_size, sequence_length, _ = x.shape
+        queries = self.W_q(x).reshape(
+            batch_size, sequence_length, self.nheads, self.d_k
+        ).transpose(1, 2)
+        keys = self.W_k(x).reshape(
+            batch_size, sequence_length, self.nheads, self.d_k
+        ).transpose(1, 2)
+        values = self.W_v(x).reshape(
+            batch_size, sequence_length, self.nheads, self.d_k
+        ).transpose(1, 2)
 
-    def attention(self, Q, K, V):
-        # shape of Q K V are (B, H, N, d_k)
-        N = Q.shape[2]
-        # dot product attention operation
-        scores = Q @ K.transpose(-2, -1) # shape: (B, H, N, N)
-        scaled_scores =  scores / math.sqrt(self.d_k)
-
-        # temporal masking by adding a mask before softmaxing
-        if self.causal_masking:
-            mask = torch.tril(torch.ones(N, N, device=Q.device)).bool() 
-            masked_scores = scaled_scores.masked_fill(~mask, float("-inf"))
-            weights = torch.softmax(masked_scores, dim=-1) # softmaxing to get weights
-        else:
-            weights = torch.softmax(scaled_scores, dim=-1) # softmaxing to get weights
-        weights = self.drop(weights)
-        outputs = weights @ V
-
-        return outputs
-
-    def forward(self, X): 
-        # shape of X: (B, N, d_model)
-        B = X.shape[0]
-        N = X.shape[1]
-
-        queries = self.W_q(X).reshape(B, N, self.H, self.d_k).permute(0, 2, 1, 3)
-        keys = self.W_k(X).reshape(B, N, self.H, self.d_k).permute(0, 2, 1, 3)
-        values = self.W_v(X).reshape(B, N, self.H, self.d_k).permute(0, 2, 1, 3)
-
-        attn_output = self.attention(queries, keys, values)
-        attn_output =  attn_output.permute(0, 2, 1, 3).reshape(B, N, self.d_model) # concatenating the output across the different heads
-
-        output = self.W_o(attn_output)
-        output = self.drop(output)
-
-        return output
+        attention = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=self.causal_masking,
+        )
+        attention = attention.transpose(1, 2).reshape(
+            batch_size, sequence_length, self.inner_dim
+        )
+        return self.drop(self.W_o(attention))

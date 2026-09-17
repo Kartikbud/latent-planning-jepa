@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 from architectures.vit_tiny import CustomVitTiny
+from architectures.modules import ProjectionMLP
 
 """
 This is the network definition for the encoder network which in the paper
@@ -20,13 +21,17 @@ class EncoderNetwork(nn.Module):
                  nheads : int = 3,
                  nlayers : int = 12,
                  d_model : int = 192,
-                 npatches : int = 256): # npatches is (H/patch_size)*(W/patch_size) 
+                 npatches : int = 256,
+                 projector_hidden_dim: int = 2048,
+                 project_output: bool = True): # npatches is (H/patch_size)*(W/patch_size)
         super().__init__()
         self.d_model = d_model
         
         self.vit = CustomVitTiny(patch, nheads, nlayers, d_model, npatches)
-        self.projector = nn.Linear(in_features=d_model, out_features=d_model)
-        self.batch_norm = nn.BatchNorm1d(d_model)
+        self.projector = (
+            ProjectionMLP(d_model, projector_hidden_dim, d_model)
+            if project_output else nn.Identity()
+        )
     
     def forward(self, x):
         # shape of input (x): (B, N, C, H, W)
@@ -34,7 +39,7 @@ class EncoderNetwork(nn.Module):
         z = self.vit(x)
         #projection step
         z = z.reshape(B*N, self.d_model)
-        z = self.batch_norm(self.projector(z))
+        z = self.projector(z)
         z = z.reshape(B, N, self.d_model)
 
         return z
@@ -45,4 +50,3 @@ class EncoderNetwork(nn.Module):
 # enc = EncoderNetwork()
 # print(enc(dummy_image).shape)
 
-      

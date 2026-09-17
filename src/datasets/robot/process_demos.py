@@ -2,7 +2,7 @@
 Merge per-demo raw HDF5s and convert with robomimic.
 
 Keeps demo_XXX.hdf5 in the raw folder untouched; writes processed demo.hdf5
-to data/robot/processed/ (or --out_dir).
+to the selected task's processed directory (or --out_dir).
 """
 
 import argparse
@@ -13,8 +13,16 @@ from pathlib import Path
 import h5py
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RAW_DIR = ROOT / "data" / "robot" / "raw_demo"
-DEFAULT_OUT_DIR = ROOT / "data" / "robot" / "processed"
+TASK_PATHS = {
+    "stack": {
+        "raw": ROOT / "data" / "robot" / "raw_demo",
+        "processed": ROOT / "data" / "robot" / "processed",
+    },
+    "lift": {
+        "raw": ROOT / "data" / "robot" / "raw_demo",
+        "processed": ROOT / "data" / "robot" / "processed",
+    },
+}
 
 
 def merge_demos(dataset_dir: Path, out_dir: Path, out_name: str = "demo.hdf5") -> Path:
@@ -52,24 +60,31 @@ def convert_robosuite(dataset_path: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge raw demos and convert with robomimic into processed/"
+        description="Merge Stack or Lift demos and convert them with robomimic"
+    )
+    parser.add_argument(
+        "--task",
+        choices=TASK_PATHS,
+        default="stack",
+        help="Task whose default input and output paths should be used (default: stack)",
     )
     parser.add_argument(
         "dataset_dir",
         nargs="?",
         type=Path,
-        default=DEFAULT_RAW_DIR,
-        help=f"Directory with demo_*.hdf5 (default: {DEFAULT_RAW_DIR})",
+        default=None,
+        help="Directory with demo_*.hdf5 (default: selected task's raw directory)",
     )
     parser.add_argument(
         "--out_dir",
         type=Path,
-        default=DEFAULT_OUT_DIR,
-        help=f"Where to write merged demo.hdf5 (default: {DEFAULT_OUT_DIR})",
+        default=None,
+        help="Where to write merged demo.hdf5 (default: selected task's processed directory)",
     )
     args = parser.parse_args()
-    dataset_dir = args.dataset_dir.expanduser().resolve()
-    out_dir = args.out_dir.expanduser().resolve()
+    paths = TASK_PATHS[args.task]
+    dataset_dir = (args.dataset_dir or paths["raw"]).expanduser().resolve()
+    out_dir = (args.out_dir or paths["processed"]).expanduser().resolve()
 
     merged = merge_demos(dataset_dir, out_dir)
     convert_robosuite(merged)

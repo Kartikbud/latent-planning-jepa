@@ -1,7 +1,7 @@
 """
-Prepare processed Stack demos for MimicGen and run data generation.
+Prepare processed Stack or Lift demos for MimicGen and run data generation.
 
-Defaults:
+Stack defaults (unchanged):
   source:  data/robot/processed/demo.hdf5
   config:  data/robot/stack_mg_config.json
   output:  data/robot/mimicgen/
@@ -24,11 +24,26 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 MIMICGEN_ROOT = ROOT / "mimicgen"
-SOURCE = ROOT / "data" / "robot" / "processed" / "demo.hdf5"
-CONFIG = ROOT / "data" / "robot" / "stack_mg_config.json"
-OUT_DIR = ROOT / "data" / "robot" / "mimicgen"
-EXP_NAME = "stack_from_human"
-TEMPLATE = MIMICGEN_ROOT / "mimicgen" / "exps" / "templates" / "robosuite" / "stack.json"
+TASKS = {
+    "stack": {
+        "source": ROOT / "data" / "robot" / "processed" / "demo.hdf5",
+        "config": ROOT / "data" / "robot" / "stack_mg_config.json",
+        "out_dir": ROOT / "data" / "robot" / "mimicgen",
+        "experiment": "stack_from_human",
+        "template": MIMICGEN_ROOT / "mimicgen" / "exps" / "templates" / "robosuite" / "stack.json",
+        "env_name": "Stack_D0",
+        "interface": "MG_Stack",
+    },
+    "lift": {
+        "source": ROOT / "data" / "robot" / "processed" / "demo.hdf5",
+        "config": ROOT / "data" / "robot" / "lift_mg_config.json",
+        "out_dir": ROOT / "data" / "robot" / "mimicgen",
+        "experiment": "lift_from_human",
+        "template": MIMICGEN_ROOT / "mimicgen" / "exps" / "templates" / "robosuite" / "lift.json",
+        "env_name": "Lift_D0",
+        "interface": "MG_Lift",
+    },
+}
 
 
 def run(cmd):
@@ -56,7 +71,7 @@ def write_train_val_mask(demo_hdf5: Path, train_ratio: float = 0.9, seed: int = 
     print(f"Wrote mask → train={len(train)} valid={len(valid)} in {demo_hdf5}")
 
 
-def cleanup_mimicgen_output(out_dir: Path, exp_name: str = EXP_NAME):
+def cleanup_mimicgen_output(out_dir: Path, exp_name: str):
     """Drop failed demos/playback and flatten MimicGen's nested exp folder into out_dir."""
     exp_dir = out_dir / exp_name
     if not exp_dir.is_dir():
@@ -87,7 +102,7 @@ def cleanup_mimicgen_output(out_dir: Path, exp_name: str = EXP_NAME):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run MimicGen generation from processed Stack demos")
+    parser = argparse.ArgumentParser(description="Run MimicGen generation from processed Stack or Lift demos")
     parser.add_argument(
         "num_trials",
         nargs="?",
@@ -95,48 +110,60 @@ def main():
         default=1000,
         help="Number of successful demos to generate (default: 1000)",
     )
+    parser.add_argument(
+        "--task",
+        choices=TASKS,
+        default="stack",
+        help="Task to generate (default: stack)",
+    )
     args = parser.parse_args()
+    task = TASKS[args.task]
+    source = task["source"]
+    config = task["config"]
+    out_dir = task["out_dir"]
 
-    if not SOURCE.exists():
-        raise FileNotFoundError(f"Source dataset not found: {SOURCE}")
+    if not source.exists():
+        raise FileNotFoundError(f"Source dataset not found: {source}")
+    if not task["template"].exists():
+        raise FileNotFoundError(f"MimicGen template not found: {task['template']}")
 
     # 1) annotate source with datagen_info
     run([
         sys.executable,
         str(MIMICGEN_ROOT / "mimicgen" / "scripts" / "prepare_src_dataset.py"),
-        "--dataset", str(SOURCE),
-        "--env_interface", "MG_Stack",
+        "--dataset", str(source),
+        "--env_interface", task["interface"],
         "--env_interface_type", "robosuite",
     ])
 
-    # 2) write config from Stack template
-    cfg = json.loads(TEMPLATE.read_text())
-    cfg["experiment"]["name"] = EXP_NAME
-    cfg["experiment"]["source"]["dataset_path"] = str(SOURCE)
-    cfg["experiment"]["generation"]["path"] = str(OUT_DIR)
+    # 2) write config from the selected task template
+    cfg = json.loads(task["template"].read_text())
+    cfg["experiment"]["name"] = task["experiment"]
+    cfg["experiment"]["source"]["dataset_path"] = str(source)
+    cfg["experiment"]["generation"]["path"] = str(out_dir)
     cfg["experiment"]["generation"]["guarantee"] = True
     cfg["experiment"]["generation"]["num_trials"] = args.num_trials
-    cfg["experiment"]["task"]["name"] = "Stack_D0"
-    cfg["experiment"]["task"]["interface"] = "MG_Stack"
+    cfg["experiment"]["task"]["name"] = task["env_name"]
+    cfg["experiment"]["task"]["interface"] = task["interface"]
     cfg["experiment"]["task"]["interface_type"] = "robosuite"
     cfg["obs"]["camera_names"] = ["agentview", "robot0_eye_in_hand"]
     cfg["obs"]["camera_height"] = 84
     cfg["obs"]["camera_width"] = 84
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2))
-    print(f"Wrote config → {CONFIG}")
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(json.dumps(cfg, indent=2))
+    print(f"Wrote config → {config}")
 
     # 3) generate
     run([
         sys.executable,
         str(MIMICGEN_ROOT / "mimicgen" / "scripts" / "generate_dataset.py"),
-        "--config", str(CONFIG),
+        "--config", str(config),
         "--auto-remove-exp",
     ])
 
     # 4) drop failures, flatten into data/robot/mimicgen/, write train/valid mask
-    cleanup_mimicgen_output(OUT_DIR, EXP_NAME)
-    print(f"Done. Generated data under {OUT_DIR}")
+    cleanup_mimicgen_output(out_dir, task["experiment"])
+    print(f"Done. Generated {args.task} data under {out_dir}")
 
 
 if __name__ == "__main__":

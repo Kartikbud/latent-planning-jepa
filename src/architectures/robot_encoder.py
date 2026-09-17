@@ -10,6 +10,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from architectures.encoder import EncoderNetwork
+from architectures.modules import ProjectionMLP
 
 """
 This is the modified encoder network that extends it to take in
@@ -33,13 +34,16 @@ class RobotEncoder(nn.Module):
                  d_model : int = 192,
                  d_state : int = 9,
                  d_state_emb : int = 64,
-                 npatches : int = 36):  # 84x84, patch 14 → 6x6 patches
+                 npatches : int = 36,
+                 projector_hidden_dim: int = 2048):  # 84x84, patch 14 → 6x6 patches
         super().__init__()
         self.encoder = EncoderNetwork(patch=patch,
                                       nheads=nheads,
                                       nlayers=nlayers,
                                       d_model=d_model,
-                                      npatches=npatches)
+                                      npatches=npatches,
+                                      projector_hidden_dim=projector_hidden_dim,
+                                      project_output=False)
 
         # small projection network for the 
         self.state_encoder = nn.Sequential(
@@ -53,14 +57,20 @@ class RobotEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(in_features=(d_model * 2), out_features=d_model),
         )
+        self.projector = ProjectionMLP(d_model, projector_hidden_dim, d_model)
 
     def forward(self, above, wrist, state):
         # above : [Batch, Window, 3, 84, 84] | wrist : [Batch, Window, 3, 84, 84] | state : [Batch, Window, 9]
-        above_emb = self.encoder(above)  # [Batch, Window, 192]
-        wrist_emb = self.encoder(wrist)  # [Batch, Window, 192]
+        # Run both views together so the shared encoder's BatchNorm sees the
+        # same mixed camera distribution during training and inference.
+        batch_size = above.shape[0]
+        view_emb = self.encoder(torch.cat((above, wrist), dim=0))
+        above_emb, wrist_emb = view_emb.split(batch_size, dim=0)
         state_emb = self.state_encoder(state) # [Batch, Window, 64]
         fusion = torch.cat((above_emb, wrist_emb, state_emb), dim=-1) # [Batch, Window, 448]
-        return self.fusion_mlp(fusion) # [Batch, Window, 192]
+        fusion = self.fusion_mlp(fusion)
+        flat = fusion.reshape(-1, fusion.shape[-1])
+        return self.projector(flat).reshape_as(fusion) # [Batch, Window, 192]
 
 
 if __name__ == "__main__":

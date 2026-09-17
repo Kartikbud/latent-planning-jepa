@@ -5,14 +5,27 @@ paths:
 
 training:
   frame_skip: 5
-  lr: 3.0e-4
+  lr: 5.0e-5
   seed: 42
   lambd: 0.1
   epochs: 10
   batch_size: 128
+  # Spawn clean readers instead of forking the process after h5py was used.
   num_workers: 8
-  persistent_workers: true
+  persistent_workers: false
   pin_memory: true
+  prefetch_factor: 2
+  # Use PyTorch's conservative FIFO delivery path for long HDF5 runs.
+  in_order: true
+  loader_timeout: 120
+  loader_start_method: spawn
+  # Compiles the encoder and predictor on CUDA. The first batch is slower while
+  # graphs compile, then subsequent batches use the optimized graphs.
+  compile_model: true
+  # Clip rare unstable updates, and refresh BatchNorm statistics from a fixed
+  # amount of training data before validation and checkpointing.
+  gradient_clip_norm: 1.0
+  bn_calibration_batches: 256
   window_size: 3
   # auto: bf16 on Ampere+ (A100, L4, ...), fp16 on older CUDA (T4); or force bf16/fp16/off
   amp_dtype: auto
@@ -23,6 +36,10 @@ model:
   pred_nheads: 16
   dropout: 0.1
   pred_nlayers: 6
+  pred_dim_head: 64
+  pred_mlp_dim: 2048
+  action_smoothing_dim: 10
+  projector_hidden_dim: 2048
   patch_size: 14
   enc_nheads: 3
   enc_nlayers: 12
@@ -33,5 +50,5 @@ loss:
   num_proj: 1024
 
 optimizer:
-  betas: [0.9, 0.95]
-  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  weight_decay: 0.001

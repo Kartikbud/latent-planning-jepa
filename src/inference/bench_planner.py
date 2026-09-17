@@ -15,6 +15,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,16 +29,19 @@ sys.path = [p for p in sys.path if p not in ("", str(ROOT), str(ROOT.resolve()))
 
 from architectures.predictor import PredictorNetwork
 from architectures.robot_encoder import RobotEncoder
-from inference.mpc import Planner
+from inference.mpc_parallel import Planner
 
 WINDOW = 3
-ACTION_DIM = 7
+FRAME_SKIP = 5
+PRIMITIVE_ACTION_DIM = 7
+ACTION_DIM = FRAME_SKIP * PRIMITIVE_ACTION_DIM
 EMBED_DIM = 192
 
 
 def load_models(zip_path: Path, device: str):
 	encoder = RobotEncoder().to(device)
 	predictor = PredictorNetwork(d_action=ACTION_DIM, window=WINDOW).to(device)
+	stats = None
 
 	with zipfile.ZipFile(zip_path, "r") as zf, tempfile.TemporaryDirectory() as tmp:
 		tmp = Path(tmp)
@@ -49,10 +53,16 @@ def load_models(zip_path: Path, device: str):
 		predictor.load_state_dict(
 			torch.load(tmp / "predictor_weights.pth", map_location=device, weights_only=True)
 		)
+		if "state_stats.pth" not in zf.namelist():
+			raise ValueError("Checkpoint has no v2 state/action statistics")
+		zf.extract("state_stats.pth", tmp)
+		stats = torch.load(tmp / "state_stats.pth", map_location="cpu", weights_only=True)
+		if stats.get("checkpoint_format_version") != 2:
+			raise ValueError("Benchmark requires a corrected v2 checkpoint")
 
 	encoder.eval()
 	predictor.eval()
-	return encoder, predictor
+	return encoder, predictor, stats
 
 
 def main():
@@ -80,22 +90,36 @@ def main():
 	print(f"checkpoint: {args.zip_path}")
 
 	t0 = time.perf_counter()
-	encoder, predictor = load_models(args.zip_path, device)
+	encoder, predictor, stats = load_models(args.zip_path, device)
 	print(f"load models: {time.perf_counter() - t0:.2f}s")
 
-	planner = Planner(device=device, enc=encoder, pred=predictor)
+	primitive_low = ((stats["action_low"] - stats["action_mean"]) / stats["action_std"]).numpy()
+	primitive_high = ((stats["action_high"] - stats["action_mean"]) / stats["action_std"]).numpy()
+	planner = Planner(
+		device=device,
+		enc=encoder,
+		pred=predictor,
+		action_dim=ACTION_DIM,
+		primitive_action_dim=PRIMITIVE_ACTION_DIM,
+		action_low=np.tile(primitive_low, FRAME_SKIP),
+		action_high=np.tile(primitive_high, FRAME_SKIP),
+		raw_action_mean=stats["action_mean"].numpy(),
+		raw_action_std=stats["action_std"].numpy(),
+	)
 	print(
 		f"CEM defaults: H={planner.H} N={planner.N} K={planner.K} T={planner.T} "
-		f"→ ~{planner.T * planner.N * planner.H} predictor forwards / plan"
+		f"→ {planner.T * planner.H} batched predictor calls / plan "
+		f"(batch size {planner.N})"
 	)
 
-	zi = torch.randn(WINDOW, EMBED_DIM, device=device)
-	a = torch.randn(WINDOW - 1, ACTION_DIM, device=device)
+	zi = torch.randn(1, EMBED_DIM, device=device)
+	a = torch.empty(0, ACTION_DIM, device=device)
 	zg = torch.randn(EMBED_DIM, device=device)
+	schedules = planner.single_switch_gripper_schedules()
 
 	# Warmup (JIT / allocator / first-call overhead)
 	t0 = time.perf_counter()
-	_ = planner.CEM(zi, a, zg)
+	_ = planner.CEM(zi, a, zg, gripper_schedules=schedules)
 	if device == "cuda":
 		torch.cuda.synchronize()
 	print(f"warmup CEM: {time.perf_counter() - t0:.2f}s")
@@ -105,7 +129,7 @@ def main():
 		if device == "cuda":
 			torch.cuda.synchronize()
 		t0 = time.perf_counter()
-		action = planner.CEM(zi, a, zg)
+		action = planner.CEM(zi, a, zg, gripper_schedules=schedules)
 		if device == "cuda":
 			torch.cuda.synchronize()
 		dt = time.perf_counter() - t0
@@ -114,7 +138,7 @@ def main():
 
 	mean_t = sum(times) / len(times)
 	print(f"\nmean plan time: {mean_t:.2f}s")
-	print(f"≈ {400 * mean_t / 60:.1f} min for a 400-step rollout (plan every step)")
+	print(f"decoded execution shape: {planner.denormalize_action_blocks(action).shape}")
 
 
 if __name__ == "__main__":

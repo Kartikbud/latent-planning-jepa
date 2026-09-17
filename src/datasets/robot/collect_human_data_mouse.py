@@ -1,5 +1,5 @@
 """
-Teleop data collection for robosuite Stack (Panda) — MimicGen-compatible.
+Teleop data collection for robosuite Stack or Lift (Panda) — MimicGen-compatible.
 
 SpaceMouse version of collect_human_data_keyb.py.
 Success = task success held briefly AND episode length < 600.
@@ -39,10 +39,23 @@ from robosuite.utils.input_utils import input2action
 macros.IMAGE_CONVENTION = "opencv"
 
 MAX_STEPS = 600
-SAVE_DIR = Path(__file__).resolve().parents[3] / "data" / "robot" / "raw_demo"
+ROOT = Path(__file__).resolve().parents[3]
 CAMERA = "agentview"
 SUCCESS_HOLD = 10  # consecutive success steps before ending episode
-ENV_NAME = "Stack"
+TASKS = {
+    "stack": {
+        "env_name": "Stack",
+        "object_attr": "cubeA",
+        "save_dir": ROOT / "data" / "robot" / "raw_demo",
+        "instruction": "pick cubeA and place it on cubeB",
+    },
+    "lift": {
+        "env_name": "Lift",
+        "object_attr": "cube",
+        "save_dir": ROOT / "data" / "robot" / "raw_demo",
+        "instruction": "grasp and lift the cube",
+    },
+}
 
 
 def set_geom_groups(env, collision=False, visual=True):
@@ -69,21 +82,25 @@ def hide_overlays(env):
     env.sim.model.site_rgba[:, 3] = 0.0
 
 
-def show_ee_guide(env):
+def show_ee_guide(env, object_attr):
     """Show EE grip site + green pointing cylinder for live teleop only.
 
-    grip_site turns red→green as it nears cubeA; grip_cylinder shows EE z-axis.
+    grip_site turns red→green as it nears the task object; grip_cylinder shows
+    the EE z-axis.
     """
     robot = env.robots[0]
     env.sim.model.site_rgba[robot.eef_cylinder_id] = np.array([0.0, 1.0, 0.0, 0.3])
     env.sim.model.site_rgba[robot.eef_site_id] = np.array([1.0, 0.0, 0.0, 0.5])
-    env._visualize_gripper_to_target(gripper=robot.gripper, target=env.cubeA)
+    env._visualize_gripper_to_target(
+        gripper=robot.gripper,
+        target=getattr(env, object_attr),
+    )
 
 
-def make_env():
+def make_env(env_name):
     controller_config = load_controller_config(default_controller="OSC_POSE")
     env = suite.make(
-        env_name=ENV_NAME,
+        env_name=env_name,
         robots="Panda",
         controller_configs=controller_config,
         has_renderer=True,
@@ -99,18 +116,18 @@ def make_env():
     )
     set_geom_groups(env, collision=False, visual=True)
     return env, {
-        "env_name": ENV_NAME,
+        "env_name": env_name,
         "robots": ["Panda"],
         "controller_configs": controller_config,
     }
 
 
-def collect_episode(env, device, record=True):
+def collect_episode(env, device, object_attr, record=True):
     """Run one teleop episode. Returns (states, actions, frames, success)."""
     env.reset()
     set_geom_groups(env, collision=False, visual=True)
     hide_overlays(env)
-    show_ee_guide(env)
+    show_ee_guide(env, object_attr)
     env.render()
     device.start_control()
 
@@ -144,7 +161,7 @@ def collect_episode(env, device, record=True):
         steps += 1
 
         # live window: show EE guide
-        show_ee_guide(env)
+        show_ee_guide(env, object_attr)
         env.render()
 
         if record:
@@ -175,10 +192,10 @@ def collect_episode(env, device, record=True):
     return states, actions, frames, success
 
 
-def review_video(frames, device=None):
+def review_video(frames, task, device=None):
     if not frames:
         return False
-    path = os.path.join(tempfile.gettempdir(), "stack_demo_review.mp4")
+    path = os.path.join(tempfile.gettempdir(), f"{task}_demo_review.mp4")
     writer = imageio.get_writer(path, fps=20)
     for f in frames:
         writer.append_data(f)
@@ -229,7 +246,7 @@ def next_demo_index(save_dir):
     return int(last.split("_")[1]) + 1
 
 
-def save_demo(save_dir, idx, states, actions, model_xml, env_info):
+def save_demo(save_dir, idx, states, actions, model_xml, env_info, env_name):
     save_dir.mkdir(parents=True, exist_ok=True)
     path = save_dir / f"demo_{idx:03d}.hdf5"
     with h5py.File(path, "w") as f:
@@ -243,7 +260,7 @@ def save_demo(save_dir, idx, states, actions, model_xml, env_info):
         grp.attrs["date"] = f"{now.month}-{now.day}-{now.year}"
         grp.attrs["time"] = f"{now.hour}:{now.minute}:{now.second}"
         grp.attrs["repository_version"] = suite.__version__
-        grp.attrs["env"] = ENV_NAME
+        grp.attrs["env"] = env_name
         grp.attrs["env_info"] = json.dumps(env_info)
         grp.attrs["total"] = len(actions)
     print(f"Saved {path} ({len(actions)} steps)")
@@ -255,7 +272,7 @@ def count_existing_demos(save_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect Stack teleop demos with SpaceMouse")
+    parser = argparse.ArgumentParser(description="Collect Stack or Lift teleop demos with SpaceMouse")
     parser.add_argument(
         "num_episodes",
         nargs="?",
@@ -266,13 +283,27 @@ def main():
     parser.add_argument("--pos_sensitivity", type=float, default=1.0)
     parser.add_argument("--rot_sensitivity", type=float, default=1.0)
     parser.add_argument(
+        "--task",
+        choices=TASKS,
+        default="stack",
+        help="Robosuite task to collect (default: stack)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Override the task-specific output directory",
+    )
+    parser.add_argument(
         "--fun",
         action="store_true",
         help="Practice teleop only — no recording, review, or saving.",
     )
     args = parser.parse_args()
+    task = TASKS[args.task]
+    save_dir = args.output_dir or task["save_dir"]
 
-    env, env_info = make_env()
+    env, env_info = make_env(task["env_name"])
     device = SpaceMouse(
         pos_sensitivity=args.pos_sensitivity,
         rot_sensitivity=args.rot_sensitivity,
@@ -280,14 +311,16 @@ def main():
 
     print(f"SpaceMouse teleop. Right button aborts / resets. Success held for {SUCCESS_HOLD} steps ends episode.")
     print("Left button click toggles gripper. Roll/pitch disabled — yaw + XYZ only.")
-    print("Task: pick cubeA and place it on cubeB.")
+    print(f"Task: {task['instruction']}.")
 
     if args.fun:
         print("\nFUN MODE — nothing will be saved. Ctrl+C to quit.")
         try:
             while True:
                 print("\n=== Practice trial (right button to reset) ===")
-                _, _, _, success = collect_episode(env, device, record=False)
+                _, _, _, success = collect_episode(
+                    env, device, task["object_attr"], record=False
+                )
                 print("Success!" if success else "Reset / incomplete. New randomization.")
         except KeyboardInterrupt:
             print("\nDone (fun mode).")
@@ -295,20 +328,22 @@ def main():
             env.close()
         return
 
-    existing = count_existing_demos(SAVE_DIR)
+    existing = count_existing_demos(save_dir)
     if existing >= args.num_episodes:
-        print(f"Already have {existing} demos in {SAVE_DIR} (target {args.num_episodes}). Nothing to do.")
+        print(f"Already have {existing} demos in {save_dir} (target {args.num_episodes}). Nothing to do.")
         env.close()
         return
 
-    print(f"Resuming Stack collection → {SAVE_DIR}")
+    print(f"Resuming {args.task.title()} collection → {save_dir}")
     print(f"Already have {existing}/{args.num_episodes}; need {args.num_episodes - existing} more.")
 
     saved = existing
     try:
         while saved < args.num_episodes:
             print(f"\n=== Trial for demo {saved + 1}/{args.num_episodes} ===")
-            states, actions, frames, success = collect_episode(env, device, record=True)
+            states, actions, frames, success = collect_episode(
+                env, device, task["object_attr"], record=True
+            )
             model_xml = env.sim.model.get_xml()
 
             if not success:
@@ -317,18 +352,20 @@ def main():
                 continue
 
             print(f"Candidate OK ({len(actions)} steps). Opening review video...")
-            if not review_video(frames, device):
+            if not review_video(frames, args.task, device):
                 print("Rejected by review. Resetting with new randomization.")
                 continue
 
-            idx = next_demo_index(SAVE_DIR)
-            save_demo(SAVE_DIR, idx, states, actions, model_xml, env_info)
+            idx = next_demo_index(save_dir)
+            save_demo(
+                save_dir, idx, states, actions, model_xml, env_info, task["env_name"]
+            )
             saved += 1
             print(f"Progress: {saved}/{args.num_episodes} saved. Next trial randomized on reset.")
     finally:
         env.close()
 
-    print(f"\nDone. {saved} demos in {SAVE_DIR}")
+    print(f"\nDone. {saved} demos in {save_dir}")
 
 
 if __name__ == "__main__":

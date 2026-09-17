@@ -33,9 +33,12 @@ class CustomVitTiny(nn.Module):
                                            causal_masking=False,
                                            adaptive=False))
         # learned positional embeddings
-        self.position_emb = nn.Parameter(torch.randn(npatches + 1, d_model))
+        self.position_emb = nn.Parameter(torch.empty(npatches + 1, d_model))
         # learned [cls] embedding
-        self.cls_emb = nn.Parameter(torch.randn(1, 1, 1, d_model))
+        self.cls_emb = nn.Parameter(torch.empty(1, 1, 1, d_model))
+        self.norm = nn.LayerNorm(d_model)
+        nn.init.trunc_normal_(self.position_emb, std=0.02)
+        nn.init.trunc_normal_(self.cls_emb, std=0.02)
 
     def forward(self, x):
         # shape of x: (B, N, C, H, W)
@@ -52,7 +55,8 @@ class CustomVitTiny(nn.Module):
 
         for layer in (self.transformer_layers):
            emb = layer(emb)
-        
+        emb = self.norm(emb)
+
         emb = emb.reshape(B, N, self.npatches + 1, self.d_model)
         emb = emb[:, :, 0, :] # shape : (512, 3, 192), this is what the predictor expects as the input
 

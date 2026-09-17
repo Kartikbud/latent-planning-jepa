@@ -19,6 +19,7 @@ __pycache__/
 src/datasets/scan_corrupt_episodes.py
 roboverse/roboverse.egg-info/
 roboverse/data/
+src/inference/bench_planner.py
 
 # Ignore dataset contents, but keep empty robot data folders in the repo.
 data/*
@@ -34,3 +35,5 @@ data/robot/raw_demo/**
 data/robot/mimicgen/**
 !data/robot/mimicgen/.gitkeep
 data/keyboard_robot
+
+runs
