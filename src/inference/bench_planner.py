@@ -30,6 +30,7 @@ sys.path = [p for p in sys.path if p not in ("", str(ROOT), str(ROOT.resolve()))
 from architectures.predictor import PredictorNetwork
 from architectures.robot_encoder import RobotEncoder
 from inference.mpc_parallel import Planner
+from primary_contract import ARCHITECTURE_ID, CHECKPOINT_FORMAT_VERSION
 
 WINDOW = 3
 FRAME_SKIP = 5
@@ -54,11 +55,17 @@ def load_models(zip_path: Path, device: str):
 			torch.load(tmp / "predictor_weights.pth", map_location=device, weights_only=True)
 		)
 		if "state_stats.pth" not in zf.namelist():
-			raise ValueError("Checkpoint has no v2 state/action statistics")
+			raise ValueError("Checkpoint has no state/action statistics")
 		zf.extract("state_stats.pth", tmp)
 		stats = torch.load(tmp / "state_stats.pth", map_location="cpu", weights_only=True)
-		if stats.get("checkpoint_format_version") != 2:
-			raise ValueError("Benchmark requires a corrected v2 checkpoint")
+		if stats.get("checkpoint_format_version") != CHECKPOINT_FORMAT_VERSION:
+			raise ValueError(
+				f"Benchmark requires checkpoint format {CHECKPOINT_FORMAT_VERSION}"
+			)
+		if stats.get("architecture_id") != ARCHITECTURE_ID:
+			raise ValueError(
+				f"Benchmark requires architecture {ARCHITECTURE_ID!r}"
+			)
 
 	encoder.eval()
 	predictor.eval()
