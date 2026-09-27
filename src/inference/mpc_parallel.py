@@ -26,6 +26,9 @@ class Planner:
 		min_std=0.05,
 		momentum: float = 0.1,
 		seed: int | None = None,
+		noise_correlation: float = 0.7,
+		fresh_fraction: float = 0.1,
+		separate_gripper_searches: bool = True,
 	):
 		self.device = torch.device(device)
 		self.enc = enc.to(self.device)
@@ -70,6 +73,13 @@ class Planner:
 		if not 0.0 <= momentum < 1.0:
 			raise ValueError(f"momentum must be in [0, 1), got {momentum}")
 		self.momentum = float(momentum)
+		if not 0.0 <= noise_correlation < 1.0:
+			raise ValueError("noise_correlation must be in [0, 1)")
+		if not 0.0 <= fresh_fraction < 1.0:
+			raise ValueError("fresh_fraction must be in [0, 1)")
+		self.noise_correlation = float(noise_correlation)
+		self.fresh_fraction = float(fresh_fraction)
+		self.separate_gripper_searches = bool(separate_gripper_searches)
 		self.sampler = np.random.default_rng(seed)
 
 	@staticmethod
@@ -112,10 +122,23 @@ class Planner:
 		return (raw - self.raw_action_mean[-1]) / self.raw_action_std[-1]
 
 	def shifted_plan(self, plan):
+		"""Discard the executed block and repeat the final block as the new tail."""
 		plan = np.asarray(plan, dtype=np.float32)
-		if plan.shape != (self.H, self.action_dim):
+		if plan.shape != (self.H, self.action_dim) or not np.isfinite(plan).all():
 			raise ValueError(f"plan must have shape {(self.H, self.action_dim)}")
-		return np.concatenate((plan[1:], self.action_mean[None]), axis=0)
+		return np.concatenate((plan[1:], plan[-1:]), axis=0)
+
+	def _sample_noise(self, count):
+		"""Unit-variance AR(1) noise across primitive time, including block boundaries."""
+		noise = self.sampler.standard_normal(
+			(count, self.H * self.block_size, self.primitive_action_dim)
+		).astype(np.float32)
+		rho = self.noise_correlation
+		if rho:
+			innovation_scale = np.sqrt(1.0 - rho * rho)
+			for step in range(1, noise.shape[1]):
+				noise[:, step] = rho * noise[:, step - 1] + innovation_scale * noise[:, step]
+		return noise.reshape(count, self.H, self.action_dim)
 
 	def _bound_actions(self, actions):
 		if self.action_low is None:
@@ -128,11 +151,13 @@ class Planner:
 		schedules = torch.as_tensor(schedules, dtype=torch.float32, device=device)
 		if schedules.ndim == 2 and schedules.shape == (self.H, self.block_size):
 			schedules = schedules.unsqueeze(0)
-		if schedules.ndim != 3 or schedules.shape[1:] != (self.H, self.block_size):
+		if schedules.ndim != 3 or schedules.shape[0] < 1 or schedules.shape[1:] != (self.H, self.block_size):
 			raise ValueError(
 				"gripper_schedules must have shape "
 				f"(S, {self.H}, {self.block_size}), got {tuple(schedules.shape)}"
 			)
+		if not torch.isfinite(schedules).all():
+			raise ValueError("gripper_schedules must be finite")
 		return schedules
 
 	def _prepare_inputs(self, zi, a, zg):
@@ -181,14 +206,15 @@ class Planner:
 
 	@torch.no_grad()
 	def CEM(self, zi, a, zg, initial_mean=None, gripper_schedules=None):
-		"""Optimize and return a complete standardized ``H x action_dim`` plan."""
+		"""Search N total candidates; optionally fit separate motion distributions per schedule."""
 		zi, a, zg = self._prepare_inputs(zi, a, zg)
 		self.pred.eval()
 		self.enc.eval()
-		base_mean = np.broadcast_to(self.action_mean, (self.H, self.action_dim)).copy()
+		prior_mean = np.broadcast_to(self.action_mean, (self.H, self.action_dim)).copy()
+		base_mean = prior_mean.copy()
 		if initial_mean is not None:
 			base_mean = np.asarray(initial_mean, dtype=np.float32).copy()
-			if base_mean.shape != (self.H, self.action_dim):
+			if base_mean.shape != (self.H, self.action_dim) or not np.isfinite(base_mean).all():
 				raise ValueError(f"initial_mean must have shape {(self.H, self.action_dim)}")
 		if self.action_low is not None:
 			base_mean = np.clip(base_mean, self.action_low, self.action_high)
@@ -198,38 +224,69 @@ class Planner:
 			None if gripper_schedules is None
 			else self._expand_gripper_schedules(gripper_schedules, self.device)
 		)
-		mean = base_mean
-		std = base_std
+		separate = schedules is not None and self.separate_gripper_searches
+		groups = schedules.shape[0] if separate else 1
+		if separate and self.N < 2 * groups:
+			raise ValueError(f"Need at least {2 * groups} total samples for {groups} gripper schedules")
+		# Preserve the total population and elite fraction, including uneven splits.
+		counts = np.full(groups, self.N // groups, dtype=int)
+		counts[:self.N % groups] += 1
+		offsets = np.concatenate(([0], np.cumsum(counts)))
+		group_indices = np.repeat(np.arange(groups), counts)
+		elite_counts = [
+			min(int(count), max(2, int(np.ceil(self.K * count / self.N))))
+			if separate else self.K for count in counts
+		]
+		mean = np.broadcast_to(base_mean, (groups, self.H, self.action_dim)).copy()
+		std = np.broadcast_to(base_std, mean.shape).copy()
+		best_samples = []
+		if separate:
+			candidate_schedules = schedules[torch.as_tensor(group_indices, device=self.device)]
 		for _ in range(self.T):
-			samples = self.sampler.normal(
-				mean, std, size=(self.N, self.H, self.action_dim),
-			)
+			noise = self._sample_noise(self.N)
+			samples = mean[group_indices] + std[group_indices] * noise
+			for group, count in enumerate(counts):
+				start, stop = int(offsets[group]), int(offsets[group + 1])
+				# Keep some broad proposals so a bad warm start cannot trap every sample.
+				fresh = min(int(count) - 1, int(np.ceil(self.fresh_fraction * count)))
+				if fresh:
+					samples[stop - fresh:stop] = prior_mean + base_std * noise[stop - fresh:stop]
+				# Score the current mean too, including the exact warm start on iteration 1.
+				samples[start] = mean[group]
 			actions = torch.as_tensor(samples, dtype=torch.float32, device=self.device)
 			actions = self._bound_actions(actions)
 			if schedules is not None:
-				# Give all N candidates coherent schedules while retaining the
-				# original global N/K CEM update for the continuous motion values.
-				schedule_indices = torch.as_tensor(
-					self.sampler.permutation(self.N) % schedules.shape[0],
-					device=self.device,
-				)
-				actions[..., self.gripper_indices] = schedules[schedule_indices]
+				if separate:
+					actions[..., self.gripper_indices] = candidate_schedules
+				else:
+					schedule_indices = torch.as_tensor(
+						self.sampler.permutation(self.N) % schedules.shape[0], device=self.device,
+					)
+					actions[..., self.gripper_indices] = schedules[schedule_indices]
 			costs = self.score_actions(zi, a, actions, zg, apply_bounds=False)
-			elite_indices = torch.topk(costs, k=self.K, largest=False).indices
-			elites = actions[elite_indices]
-			elite_mean = elites.mean(dim=0).cpu().numpy()
-			elite_std = elites.std(dim=0, unbiased=False).cpu().numpy()
+			best_samples.append(actions[costs.argmin()].unsqueeze(0).clone())
+			elite_means, elite_stds = [], []
+			for group, k in enumerate(elite_counts):
+				start, stop = int(offsets[group]), int(offsets[group + 1])
+				elite_indices = torch.topk(costs[start:stop], k=k, largest=False).indices + start
+				elites = actions[elite_indices]
+				elite_means.append(elites.mean(dim=0))
+				elite_stds.append(elites.std(dim=0, unbiased=False))
+			elite_mean = torch.stack(elite_means).cpu().numpy()
+			elite_std = torch.stack(elite_stds).cpu().numpy()
 			mean = self.momentum * mean + (1.0 - self.momentum) * elite_mean
 			std = np.maximum(
 				self.momentum * std + (1.0 - self.momentum) * elite_std,
 				self.min_std,
 			)
 
-		candidate_means = torch.as_tensor(mean, dtype=torch.float32, device=self.device).unsqueeze(0)
+		candidate_means = torch.as_tensor(mean, dtype=torch.float32, device=self.device)
 		candidate_means = self._bound_actions(candidate_means)
 		if schedules is not None:
-			candidate_means = candidate_means.expand(schedules.shape[0], -1, -1).clone()
+			if not separate:
+				candidate_means = candidate_means.expand(schedules.shape[0], -1, -1).clone()
 			candidate_means[..., self.gripper_indices] = schedules
-		costs = self.score_actions(zi, a, candidate_means, zg, apply_bounds=False)
-		best = candidate_means[costs.argmin()]
+		final_candidates = torch.cat([candidate_means, *best_samples], dim=0)
+		costs = self.score_actions(zi, a, final_candidates, zg, apply_bounds=False)
+		best = final_candidates[costs.argmin()]
 		return best.cpu().numpy().astype(np.float32, copy=False)

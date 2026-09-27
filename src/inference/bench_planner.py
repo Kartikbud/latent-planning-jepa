@@ -115,8 +115,12 @@ def main():
 	)
 	print(
 		f"CEM defaults: H={planner.H} N={planner.N} K={planner.K} T={planner.T} "
-		f"→ {planner.T * planner.H} batched predictor calls / plan "
-		f"(batch size {planner.N})"
+		f"→ {(planner.T + 1) * planner.H} batched predictor calls / plan "
+		f"(search batch size {planner.N}; smaller final candidate comparison)"
+	)
+	print(
+		f"motion correlation={planner.noise_correlation}, fresh fraction={planner.fresh_fraction}, "
+		f"separate gripper searches={planner.separate_gripper_searches}; timing cold-start calls"
 	)
 
 	zi = torch.randn(1, EMBED_DIM, device=device)

@@ -292,7 +292,7 @@ def postprocess_action(action):
 
 
 def held_gripper_schedule(planner, command):
-	"""Keep the last executed gripper command fixed throughout a CEM plan."""
+	"""Keep a specified gripper command fixed throughout a CEM plan."""
 	raw = np.full((1, planner.H, planner.block_size), command, dtype=np.float32)
 	return (raw - planner.raw_action_mean[-1]) / planner.raw_action_std[-1]
 
@@ -306,6 +306,7 @@ def run_rollout(
 	stats,
 	writer,
 	stage_settings,
+	warm_start=True,
 ):
 	for stage in entry["stages"]:
 		if stage["name"] not in stage_settings:
@@ -314,6 +315,8 @@ def run_rollout(
 		threshold = float(settings["threshold"])
 		if int(settings["budget"]) < 1 or not np.isfinite(threshold) or threshold < 0:
 			raise ValueError(f"Invalid settings for {stage['name']!r} stage")
+		if float(settings["budget"]) % FRAME_SKIP:
+			raise ValueError(f"Stage budgets must be multiples of {FRAME_SKIP} primitive steps")
 	obs = reset_to_eval_state(env, entry)
 	writer.append_data(render_frame(env))
 	z = encode_observation(encoder, obs, device, stats)
@@ -321,9 +324,10 @@ def run_rollout(
 	context = deque([z], maxlen=WINDOW)
 	action_history = deque(maxlen=WINDOW - 1)
 	total_steps = 0
-	last_gripper_command = None
 
 	for number, stage in enumerate(entry["stages"], 1):
+		# Warm starts belong to this rollout and goal; never carry grasp plans into lift.
+		previous_plan = None
 		goal = stage["goal"]
 		budget = int(stage_settings[stage["name"]]["budget"])
 		threshold = float(stage_settings[stage["name"]]["threshold"])
@@ -344,13 +348,21 @@ def run_rollout(
 				torch.stack(tuple(action_history))
 				if action_history else torch.empty(0, PREDICTOR_ACTION_DIM, device=device)
 			)
-			if stage["name"] == "lift" and last_gripper_command is not None:
-				gripper_schedules = held_gripper_schedule(planner, last_gripper_command)
+			if stage["name"] == "lift":
+				gripper_schedules = held_gripper_schedule(planner, 1.0)
 			else:
 				gripper_schedules = planner.single_switch_gripper_schedules()
-			plan = planner.CEM(zi, a, goal, gripper_schedules=gripper_schedules)
+			initial_mean = (
+				planner.shifted_plan(previous_plan)
+				if warm_start and previous_plan is not None else None
+			)
+			plan = planner.CEM(
+				zi, a, goal, initial_mean=initial_mean, gripper_schedules=gripper_schedules,
+			)
+			previous_plan = plan
 			raw_blocks = planner.denormalize_action_blocks(plan)
-			for raw_block in raw_blocks:
+			# Execute one ordered 5-action block, then replan from observation.
+			for raw_block in raw_blocks[:1]:
 				executed = []
 				for raw_action in raw_block:
 					action = postprocess_action(raw_action)
@@ -358,11 +370,12 @@ def run_rollout(
 					set_geom_groups(env)
 					writer.append_data(render_frame(env))
 					executed.append(action)
-					last_gripper_command = float(action[-1])
 					steps += 1
 					total_steps += 1
 					if env._check_success():
 						return True, total_steps
+					if done:
+						return False, total_steps
 					if done or steps >= budget:
 						break
 
@@ -416,10 +429,17 @@ def evaluate(args):
 		action_low=action_low, action_high=action_high,
 		raw_action_mean=action_mean, raw_action_std=action_std,
 		min_std=0.05, momentum=0.1, seed=args.seed,
+		noise_correlation=args.noise_correlation, fresh_fraction=args.fresh_fraction,
+		separate_gripper_searches=not args.pooled_gripper_search,
 	)
 	entries = load_eval_bank(encoder, args.evals, args.labels, device, stats, args.demo)
-	rng = np.random.default_rng(args.seed)
-	indices = rng.choice(len(entries), args.rollouts, replace=args.rollouts > len(entries))
+	entries.sort(key=lambda entry: int(re.fullmatch(r"demo_(\d+)", entry["name"]).group(1)))
+	if args.demo is None:
+		if args.rollouts > len(entries):
+			raise ValueError(f"Requested {args.rollouts} unique evals, but only {len(entries)} labeled demos are available")
+		indices = range(args.rollouts)
+	else:
+		indices = [0] * args.rollouts
 	stage_settings = {
 		"grasp": {
 			"budget": args.grasp_budget,
@@ -448,6 +468,7 @@ def evaluate(args):
 				success, steps = run_rollout(
 					env, planner, encoder, entry, device, stats, writer,
 					stage_settings,
+					warm_start=not args.no_warm_start,
 				)
 			finally:
 				writer.close()
@@ -474,15 +495,20 @@ def main():
 	)
 	parser.add_argument("--rollout-dir", type=Path, default=ROOT / "rollouts")
 	parser.add_argument("--demo")
-	parser.add_argument("--rollouts", type=int, default=5)
-	parser.add_argument("--grasp-budget", type=int, default=100)
+	parser.add_argument("--rollouts", type=int, default=50)
+	parser.add_argument("--grasp-budget", type=int, default=200)
 	parser.add_argument("--grasp-threshold", type=float, default=0.05)
 	parser.add_argument("--lift-budget", type=int, default=100)
 	parser.add_argument("--lift-threshold", type=float, default=0.05)
 	parser.add_argument(
-		"--disable-thresholds", action="store_true",
+		"--disable-thresholds", action="store_true", default=True,
 		help="Run each stage for its complete fixed budget; latent MSE is diagnostic only",
 	)
+	parser.add_argument("--enable-thresholds", dest="disable_thresholds", action="store_false")
+	parser.add_argument("--no-warm-start", action="store_true", help="Start each planning call from the action prior")
+	parser.add_argument("--noise-correlation", type=float, default=0.7, help="Primitive-step motion correlation; 0 disables smoothing")
+	parser.add_argument("--fresh-fraction", type=float, default=0.1, help="Fraction of broad recovery proposals per search group")
+	parser.add_argument("--pooled-gripper-search", action="store_true", help="Pool elites across gripper schedules instead of fitting each separately")
 	parser.add_argument("--samples", type=int, default=300)
 	parser.add_argument("--elites", type=int, default=30)
 	parser.add_argument("--iterations", type=int, default=10)
@@ -492,6 +518,8 @@ def main():
 		parser.error("--rollouts must be positive")
 	if min(args.grasp_budget, args.lift_budget) < 1:
 		parser.error("stage budgets must be positive")
+	if args.grasp_budget % FRAME_SKIP or args.lift_budget % FRAME_SKIP:
+		parser.error(f"stage budgets must be multiples of {FRAME_SKIP}")
 	if min(args.grasp_threshold, args.lift_threshold) < 0:
 		parser.error("stage thresholds must be nonnegative")
 	evaluate(args)
