@@ -126,6 +126,7 @@ class RobotPrimaryDataset(Dataset):
 		state_std: torch.Tensor | None = None,
 		action_mean: torch.Tensor | None = None,
 		action_std: torch.Tensor | None = None,
+		h5_path: Path | None = None,
 	):
 		super().__init__()
 		if frame_skip < 1:
@@ -135,7 +136,7 @@ class RobotPrimaryDataset(Dataset):
 
 		self.frame_skip = frame_skip
 		self.window = window
-		self.h5_path = Path(data_dir) / "robot" / "mimicgen" / "demo.hdf5"
+		self.h5_path = Path(h5_path) if h5_path is not None else Path(data_dir) / "robot" / "mimicgen" / "demo.hdf5"
 		if not self.h5_path.exists():
 			raise FileNotFoundError(f"Dataset not found: {self.h5_path}")
 
