@@ -1,0 +1,11 @@
+# Local collection stack: Python 3.10. Colab notebooks manage their own installs.
+mujoco==2.3.2
+hidapi
+opencv-python
+pynput
+termcolor
+psutil
+tensorboardX
+egl_probe>=1.0.1
+gdown
+chardet

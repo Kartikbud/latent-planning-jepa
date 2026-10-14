@@ -257,8 +257,8 @@ def main() -> None:
 	parser.add_argument(
 		"--task",
 		choices=TASK_PATHS,
-		default="stack",
-		help="Task whose default input and output paths should be used (default: stack)",
+		default="lift",
+		help="Task whose default input and output paths should be used (default: lift)",
 	)
 	parser.add_argument("--input", type=Path, default=None)
 	parser.add_argument("--output", type=Path, default=None)

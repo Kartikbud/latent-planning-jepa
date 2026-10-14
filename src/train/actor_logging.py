@@ -31,15 +31,20 @@ def start_actor_wandb(options, *, training_resume, saved_run, output_dir, config
     if wandb.run is not None:
         raise RuntimeError('An active W&B run already exists. Finish it before starting training again.')
     # Read the Colab secret only at runtime. Never put the key in config/checkpoints.
-    from google.colab import userdata
     try:
-        token = userdata.get('WANDB_TOKEN')
-    except Exception as exc:
-        raise RuntimeError('Enable notebook access to the WANDB_TOKEN Colab secret, or disable W&B') from exc
-    if not token:
-        raise ValueError('WANDB_TOKEN is empty')
-    wandb.login(key=token, relogin=True)
-    del token
+        from google.colab import userdata
+    except ImportError:
+        # Local CLI: use `wandb login` or WANDB_API_KEY; never persist the key here.
+        wandb.login()
+    else:
+        try:
+            token = userdata.get('WANDB_TOKEN')
+        except Exception as exc:
+            raise RuntimeError('Enable access to WANDB_TOKEN in Colab, or disable W&B') from exc
+        if not token:
+            raise ValueError('WANDB_TOKEN is empty')
+        wandb.login(key=token, relogin=True)
+        del token
     run = wandb.init(project=project, entity=entity, name=options.get('name', 'primary_actor'),
                      id=run_id, resume='must' if should_resume else 'never',
                      config=config, mode='online', save_code=False, sync_tensorboard=False)

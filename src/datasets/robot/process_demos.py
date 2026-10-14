@@ -65,8 +65,8 @@ def main():
     parser.add_argument(
         "--task",
         choices=TASK_PATHS,
-        default="stack",
-        help="Task whose default input and output paths should be used (default: stack)",
+        default="lift",
+        help="Task whose default input and output paths should be used (default: lift)",
     )
     parser.add_argument(
         "dataset_dir",

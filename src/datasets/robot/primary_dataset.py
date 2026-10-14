@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 """
-PyTorch dataset over MimicGen Stack demos (robomimic-style HDF5).
+PyTorch dataset over MimicGen robot demos (robomimic-style HDF5).
 
 Each sample contains a strided observation sequence and one ordered action block for
 each transition:

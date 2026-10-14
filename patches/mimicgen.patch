@@ -1,0 +1,170 @@
+diff --git a/mimicgen/__init__.py b/mimicgen/__init__.py
+index 0affb00..70b4be4 100644
+--- a/mimicgen/__init__.py
++++ b/mimicgen/__init__.py
+@@ -17,6 +17,7 @@ try:
+     from mimicgen.envs.robosuite.coffee import *
+     from mimicgen.envs.robosuite.three_piece_assembly import *
+     from mimicgen.envs.robosuite.mug_cleanup import *
++    from mimicgen.envs.robosuite.lift import *
+     from mimicgen.envs.robosuite.stack import *
+     from mimicgen.envs.robosuite.nut_assembly import *
+     from mimicgen.envs.robosuite.pick_place import *
+diff --git a/mimicgen/configs/robosuite.py b/mimicgen/configs/robosuite.py
+index b63a664..ee51f07 100644
+--- a/mimicgen/configs/robosuite.py
++++ b/mimicgen/configs/robosuite.py
+@@ -211,6 +211,29 @@ class Square_Config(MG_Config):
+         self.task.task_spec.do_not_lock_keys()
+ 
+ 
++class Lift_Config(MG_Config):
++    """Corresponds to the robosuite Lift task and variants."""
++
++    NAME = "lift"
++    TYPE = "robosuite"
++
++    def task_config(self):
++        # The complete reach-grasp-lift motion is one object-centric subtask.
++        # The final subtask always terminates at the end of the demonstration.
++        self.task.task_spec.subtask_1 = dict(
++            object_ref="cube",
++            subtask_term_signal=None,
++            subtask_term_offset_range=None,
++            selection_strategy="nearest_neighbor_object",
++            selection_strategy_kwargs=dict(nn_k=3),
++            action_noise=0.05,
++            num_interpolation_steps=5,
++            num_fixed_steps=0,
++            apply_noise_during_interpolation=False,
++        )
++        self.task.task_spec.do_not_lock_keys()
++
++
+ class Stack_Config(MG_Config):
+     """
+     Corresponds to robosuite Stack task and variants.
+diff --git a/mimicgen/env_interfaces/robosuite.py b/mimicgen/env_interfaces/robosuite.py
+index a0d77fd..8878e9f 100644
+--- a/mimicgen/env_interfaces/robosuite.py
++++ b/mimicgen/env_interfaces/robosuite.py
+@@ -170,6 +170,29 @@ class RobosuiteInterface(MG_EnvInterface):
+         return PoseUtils.make_pose(obj_pos, obj_rot)
+ 
+ 
++class MG_Lift(RobosuiteInterface):
++    """Corresponds to the robosuite Lift task and variants."""
++
++    def get_object_poses(self):
++        return dict(
++            cube=self.get_object_pose(
++                obj_name=self.env.cube.root_body,
++                obj_type="body",
++            ),
++        )
++
++    def get_subtask_term_signals(self):
++        # The one-subtask Lift config does not need this boundary, but storing
++        # it keeps source datasets compatible with MimicGen's HDF5 parser and
++        # allows a future reach/grasp + lift task split without re-annotation.
++        return dict(
++            grasp=int(self.env._check_grasp(
++                gripper=self.env.robots[0].gripper,
++                object_geoms=self.env.cube,
++            )),
++        )
++
++
+ class MG_Coffee(RobosuiteInterface):
+     """
+     Corresponds to robosuite Coffee task and variants.
+diff --git a/mimicgen/envs/robosuite/lift.py b/mimicgen/envs/robosuite/lift.py
+new file mode 100644
+--- /dev/null
++++ b/mimicgen/envs/robosuite/lift.py
+@@ -0,0 +1,21 @@
++# Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++#
++# Licensed under the NVIDIA Source Code License [see LICENSE for details].
++
++"""MimicGen-compatible version of the robosuite Lift task."""
++
++from robosuite.environments.manipulation.lift import Lift
++
++from mimicgen.envs.robosuite.single_arm_env_mg import SingleArmEnv_MG
++
++
++class Lift_D0(Lift, SingleArmEnv_MG):
++    """Augment the standard robosuite Lift task for MimicGen."""
++
++    def edit_model_xml(self, xml_str):
++        # Resolve asset paths in stored source demonstrations consistently with
++        # the other MimicGen robosuite environments.
++        return SingleArmEnv_MG.edit_model_xml(self, xml_str)
++
++    def reward(self, action=None):
++        return Lift.reward(self, action=action)
+diff --git a/mimicgen/exps/templates/robosuite/lift.json b/mimicgen/exps/templates/robosuite/lift.json
+new file mode 100644
+--- /dev/null
++++ b/mimicgen/exps/templates/robosuite/lift.json
+@@ -0,0 +1,59 @@
++{
++    "name": "lift",
++    "type": "robosuite",
++    "experiment": {
++        "name": "demo",
++        "source": {
++            "dataset_path": null,
++            "filter_key": null,
++            "n": null,
++            "start": null
++        },
++        "generation": {
++            "path": null,
++            "guarantee": false,
++            "keep_failed": true,
++            "num_trials": 10,
++            "select_src_per_subtask": false,
++            "transform_first_robot_pose": false,
++            "interpolate_from_last_target_pose": true
++        },
++        "task": {
++            "name": null,
++            "robot": null,
++            "gripper": null,
++            "env_meta_update_kwargs": {},
++            "interface": null,
++            "interface_type": null
++        },
++        "max_num_failures": 50,
++        "render_video": true,
++        "num_demo_to_render": 50,
++        "num_fail_demo_to_render": 50,
++        "log_every_n_attempts": 50,
++        "seed": 1
++    },
++    "obs": {
++        "collect_obs": true,
++        "camera_names": [],
++        "camera_height": 84,
++        "camera_width": 84
++    },
++    "task": {
++        "task_spec": {
++            "subtask_1": {
++                "object_ref": "cube",
++                "subtask_term_signal": null,
++                "subtask_term_offset_range": null,
++                "selection_strategy": "nearest_neighbor_object",
++                "selection_strategy_kwargs": {
++                    "nn_k": 3
++                },
++                "action_noise": 0.05,
++                "num_interpolation_steps": 5,
++                "num_fixed_steps": 0,
++                "apply_noise_during_interpolation": false
++            }
++        }
++    }
++}

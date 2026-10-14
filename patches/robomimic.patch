@@ -1,0 +1,112 @@
+diff --git a/robomimic/envs/env_robosuite.py b/robomimic/envs/env_robosuite.py
+index ba146b2..b4b095c 100644
+--- a/robomimic/envs/env_robosuite.py
++++ b/robomimic/envs/env_robosuite.py
+@@ -4,6 +4,7 @@ to provide a standardized environment API for training policies and interacting
+ with metadata present in datasets.
+ """
+ import json
++import ctypes
+ import numpy as np
+ from copy import deepcopy
+ 
+@@ -42,6 +43,32 @@ except ImportError:
+     MUJOCO_EXCEPTIONS = []
+ 
+ 
++def _fix_visual_geoms(env, collision=False, visual=True):
++    """Hide collision geoms / show visual meshes.
++
++    MuJoCo 2.3.2 + NumPy 2.x exposes vopt.geomgroup with stride 0, so
++    ``geomgroup[i] = ...`` writes every group at once and robosuite's
++    ``render_collision_mesh=False`` is a no-op. Write the underlying bytes
++    via ctypes instead. Needed so MimicGen / robomimic camera obs aren't
++    covered in the green/blue collision-mesh look.
++    """
++    sim = getattr(env, "sim", None)
++    if sim is None:
++        return
++    ctx = getattr(sim, "_render_context_offscreen", None)
++    if ctx is None:
++        return
++    try:
++        addr = ctx.vopt.geomgroup.__array_interface__["data"][0]
++        groups = (ctypes.c_uint8 * 6).from_address(addr)
++        for i in range(6):
++            groups[i] = 0
++        groups[0] = int(collision)
++        groups[1] = int(visual)
++    except Exception:
++        pass
++
++
+ class EnvRobosuite(EB.EnvBase):
+     """Wrapper class for robosuite environments (https://github.com/ARISE-Initiative/robosuite)"""
+     def __init__(
+@@ -91,6 +118,8 @@ class EnvRobosuite(EB.EnvBase):
+             use_object_obs=True,
+             use_camera_obs=use_image_obs,
+             camera_depths=use_depth_obs,
++            render_collision_mesh=False,
++            render_visual_mesh=True,
+         )
+         if render and self.is_v15_or_higher:
+             update_kwargs["renderer"] = "mujoco"
+@@ -114,6 +143,7 @@ class EnvRobosuite(EB.EnvBase):
+ 
+         self._init_kwargs = deepcopy(kwargs)
+         self.env = robosuite.make(self._env_name, **kwargs)
++        _fix_visual_geoms(self.env)
+         self.lang = lang
+         self._lang_emb = LangUtils.get_lang_emb(self.lang)
+ 
+@@ -136,6 +166,7 @@ class EnvRobosuite(EB.EnvBase):
+             done (bool): whether the task is done
+             info (dict): extra information
+         """
++        _fix_visual_geoms(self.env)
+         obs, r, done, info = self.env.step(action)
+         obs = self.get_observation(obs)
+         info["is_success"] = self.is_success()
+@@ -156,8 +187,10 @@ class EnvRobosuite(EB.EnvBase):
+             # unset the ep meta to clear out any ep meta that was previously set
+             # (this feature was set from robosuite v1.5 onwards)
+             self.env.unset_ep_meta()
+-        di = self.env.reset()
+-        return self.get_observation(di)        
++        self.env.reset()
++        _fix_visual_geoms(self.env)
++        # Re-fetch obs after geom fix so initial camera frames aren't collision-colored.
++        return self.get_observation()        
+ 
+     def reset_to(self, state):
+         """
+@@ -195,6 +228,7 @@ class EnvRobosuite(EB.EnvBase):
+                 xml = self.env.edit_model_xml(state["model"])
+             self.env.reset_from_xml_string(xml)
+             self.env.sim.reset()
++            _fix_visual_geoms(self.env)
+             if not self._is_v1:
+                 # hide teleop visualization after restoring from model
+                 self.env.sim.model.site_rgba[self.env.eef_site_id] = np.array([0., 0., 0., 0.])
+@@ -202,6 +236,7 @@ class EnvRobosuite(EB.EnvBase):
+         if "states" in state:
+             self.env.sim.set_state_from_flattened(state["states"])
+             self.env.sim.forward()
++            _fix_visual_geoms(self.env)
+             should_ret = True
+ 
+         if "goal" in state:
+@@ -226,10 +261,12 @@ class EnvRobosuite(EB.EnvBase):
+             camera_name = sorted(self._init_kwargs.get("camera_names", ["agentview"]))[0]
+ 
+         if mode == "human":
++            _fix_visual_geoms(self.env)
+             cam_id = self.env.sim.model.camera_name2id(camera_name)
+             self.env.viewer.set_camera(cam_id)
+             return self.env.render()
+         elif mode == "rgb_array":
++            _fix_visual_geoms(self.env)
+             im = self.env.sim.render(height=height, width=width, camera_name=camera_name)
+             # if self.use_depth_obs:
+             #     # render() returns a tuple when self.use_depth_obs=True

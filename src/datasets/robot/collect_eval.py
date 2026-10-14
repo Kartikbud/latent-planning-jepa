@@ -410,8 +410,8 @@ def main() -> None:
 	parser.add_argument(
 		"--task",
 		choices=TASKS,
-		default="stack",
-		help="Robosuite task to collect (default: stack)",
+		default="lift",
+		help="Robosuite task to collect (default: lift)",
 	)
 	parser.add_argument(
 		"--output-dir",

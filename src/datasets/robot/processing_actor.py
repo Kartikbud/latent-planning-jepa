@@ -3,11 +3,11 @@
     python src/datasets/robot/processing_actor.py --scan-only
     python src/datasets/robot/processing_actor.py
     hf auth login
-    python src/datasets/robot/processing_actor.py --upload-only
+    python src/datasets/robot/processing_actor.py --upload-only --repo-id USERNAME/DATASET
 
 Output: data/robot/actor/demo_actor.hdf5. Source files are never modified.
 The output is a directly downloadable HDF5, not a Hugging Face Arrow dataset.
-Use hf_hub_download(repo_id='kartikbud/robosuite_lift_jepa',
+Use hf_hub_download(repo_id='USERNAME/DATASET',
     repo_type='dataset', filename='demo_actor.hdf5', local_dir='/content/data/actor').
 No archive extraction or second full-size copy is needed.
 
@@ -18,7 +18,6 @@ goal_phase [N] (0 grasp, 1 final), and actor_action_mask [N,frame_skip].
 The actor target is the LAST action block. Masked commands reach beyond the
 grasp goal; they remain valid world-model targets. Never feed the future fourth
 observation into the actor or treat the goal as a consecutive world-model frame.
-The current actor does not yet have a training loader for this new schema.
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_INPUT = ROOT / 'data/robot/mimicgen/demo_rechunked.hdf5'
 DEFAULT_OUTPUT = ROOT / 'data/robot/actor/demo_actor.hdf5'
-REPO_ID = 'kartikbud/robosuite_lift_jepa'
 SIGNAL = 'datagen_info/subtask_term_signals/grasp'
 OBS_KEYS = ('agentview_image', 'robot0_eye_in_hand_image',
             'robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos')
@@ -174,7 +172,7 @@ def upload(output_path, repo_id):
         if f.attrs.get('actor_dataset_version') != 1:
             raise ValueError('Not a processed actor dataset')
     api = HfApi()
-    api.whoami()  # Uses HF_TOKEN or local `hf auth login`; never embeds credentials.
+    api.whoami()  # Uses the machine's saved Hugging Face login (or HF_TOKEN).
     api.create_repo(repo_id=repo_id, repo_type='dataset', private=True, exist_ok=True)
     if not api.repo_info(repo_id=repo_id, repo_type='dataset').private:
         raise ValueError('Repository is public; refusing to publish data without explicit approval')
@@ -194,8 +192,11 @@ def main():
     mode.add_argument('--scan-only', action='store_true')
     mode.add_argument('--upload', action='store_true', help='Process, then upload privately')
     mode.add_argument('--upload-only', action='store_true', help='Upload an already processed output')
-    parser.add_argument('--repo-id', default=REPO_ID)
+    parser.add_argument('--repo-id', help='Upload destination: USERNAME/DATASET or ORGANIZATION/DATASET')
     args = parser.parse_args()
+    if args.upload or args.upload_only:
+        if not args.repo_id or len(args.repo_id.split('/')) != 2 or not all(args.repo_id.split('/')):
+            parser.error('Uploads require --repo-id USERNAME/DATASET (or ORGANIZATION/DATASET)')
     if not args.upload_only:
         process(args.input, args.output, args.frame_skip, args.scan_only)
     if args.upload or args.upload_only:

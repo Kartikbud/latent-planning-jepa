@@ -2,8 +2,7 @@
 myenv
 .python-version
 
-# notebooks (Colab copies — not for repo)
-notebooks/
+# Notebooks are public source; only generated checkpoints are ignored.
 .ipynb_checkpoints/
 
 # training artifacts
@@ -14,6 +13,11 @@ logs/
 __pycache__/
 *.py[cod]
 .DS_Store
+.vscode/
+.env
+.env.*
+wandb/
+wandb_run.json
 
 # misc local scripts
 src/datasets/scan_corrupt_episodes.py
@@ -36,4 +40,6 @@ data/robot/mimicgen/**
 !data/robot/mimicgen/.gitkeep
 data/keyboard_robot
 
-runs
+runs/
+tmp/
+tests/

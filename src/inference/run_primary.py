@@ -1,74 +1,55 @@
-"""Closed-loop Lift evaluation for the corrected primary LeWM checkpoint."""
-
-from __future__ import annotations
-
+"""Evaluate Lift with goal-conditioned actor-residual CEM and save rollout videos."""
 import argparse
+import os
+import sys
 import ctypes
 import json
 import re
-import sys
 import tempfile
 import time
 import zipfile
 from collections import deque
 from pathlib import Path
-
 import h5py
 import imageio.v2 as imageio
-import mujoco
 import numpy as np
 import torch
-
-
 ROOT = Path(__file__).resolve().parents[2]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-	sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from src.architectures.actor import GoalActor
+from src.architectures.robot_encoder import RobotEncoder
+from src.architectures.predictor import PredictorNetwork
+from src.datasets.robot.primary_dataset import (build_robot_state,
+    normalize_robot_state, normalize_robot_images)
+from src.inference.actor_planner import ActorPlanner
+from src.primary_contract import (CHECKPOINT_FORMAT_VERSION, ARCHITECTURE_ID,
+    ACTION_ENCODING_ID, IMAGE_NORMALIZATION_ID)
+WINDOW, EMBEDDING_DIM, FRAME_SKIP = 3, 192, 5
+PRIMITIVE_ACTION_DIM, PREDICTOR_ACTION_DIM = 7, 35
+CONTROL_FREQ, IMAGE_SIZE, ACTION_SMOOTHING_DIM = 20, 84, 64
+ENV_NAME, CAM_ABOVE, CAM_WRIST = 'Lift_D0', 'agentview', 'robot0_eye_in_hand'
 
-from architectures.predictor import PredictorNetwork
-from architectures.robot_encoder import RobotEncoder
-from datasets.robot.primary_dataset import (
-	build_robot_state,
-	normalize_robot_images,
-	normalize_robot_state,
-)
-from inference.mpc_parallel import Planner
-from primary_contract import (
-	ACTION_ENCODING_ID,
-	ARCHITECTURE_ID,
-	CHECKPOINT_FORMAT_VERSION,
-	IMAGE_NORMALIZATION_ID,
-)
+def setup_simulator():
+    # Delay simulator imports so --help and checkpoint tests work without MuJoCo.
+    global mujoco, suite
+    os.environ.setdefault('MUJOCO_GL', 'egl' if sys.platform.startswith('linux') else 'glfw')
+    import mujoco
+    import robosuite as suite
+    import robosuite.macros as macros
+    from robosuite.environments.manipulation.lift import Lift
+    from mimicgen.envs.robosuite.single_arm_env_mg import SingleArmEnv_MG
+    if 'Lift_D0' not in suite.ALL_ENVIRONMENTS:
+        class Lift_D0(Lift, SingleArmEnv_MG):
+            def edit_model_xml(self, xml_str):
+                return SingleArmEnv_MG.edit_model_xml(self, xml_str)
+            def reward(self, action=None):
+                return Lift.reward(self, action=action)
+    macros.IMAGE_CONVENTION = 'opencv'
 
-import robosuite as suite
-import robosuite.macros as macros
-from robosuite.controllers import load_controller_config
-from robosuite.environments.manipulation.lift import Lift
-from mimicgen.envs.robosuite.single_arm_env_mg import SingleArmEnv_MG
-
-
-class Lift_D0(Lift, SingleArmEnv_MG):
-	def edit_model_xml(self, xml_str):
-		return SingleArmEnv_MG.edit_model_xml(self, xml_str)
-
-	def reward(self, action=None):
-		return Lift.reward(self, action=action)
-
-
-CAM_ABOVE = "agentview"
-CAM_WRIST = "robot0_eye_in_hand"
-ENV_NAME = "Lift_D0"
-IMAGE_SIZE = 84
-WINDOW = 3
-EMBEDDING_DIM = 192
-FRAME_SKIP = 5
-PRIMITIVE_ACTION_DIM = 7
-PREDICTOR_ACTION_DIM = FRAME_SKIP * PRIMITIVE_ACTION_DIM
-HORIZON = 5
-PLAN_STEPS = FRAME_SKIP * HORIZON
-CONTROL_FREQ = 20
-macros.IMAGE_CONVENTION = "opencv"
-
+def load_controller_config(*args, **kwargs):
+    from robosuite.controllers import load_controller_config as load
+    return load(*args, **kwargs)
 
 def select_checkpoint(model_dir: Path) -> Path:
 	best = model_dir / "best_model.zip"
@@ -106,6 +87,7 @@ def load_models(checkpoint: Path, device):
 			"frame_skip": FRAME_SKIP,
 			"primitive_action_dim": PRIMITIVE_ACTION_DIM,
 			"predictor_action_dim": PREDICTOR_ACTION_DIM,
+			"action_smoothing_dim": ACTION_SMOOTHING_DIM,
 		}
 		for key, value in expected.items():
 			if stats.get(key) != value:
@@ -114,14 +96,17 @@ def load_models(checkpoint: Path, device):
 					"This evaluator requires a newly trained corrected checkpoint."
 				)
 
+		actor = GoalActor(**stats["actor_config"]).to(device)
+		actor.load_state_dict(_load_torch(zf, "actor_weights.pth", tmp, True))
+		actor.eval()
 		encoder = RobotEncoder().to(device)
-		predictor = PredictorNetwork(d_action=PREDICTOR_ACTION_DIM, window=WINDOW).to(device)
+		predictor = PredictorNetwork(d_action=PREDICTOR_ACTION_DIM, window=WINDOW, action_smoothing_dim=ACTION_SMOOTHING_DIM).to(device)
 		encoder.load_state_dict(_load_torch(zf, "encoder_weights.pth", tmp, True))
 		predictor.load_state_dict(_load_torch(zf, "predictor_weights.pth", tmp, True))
 
 	encoder.eval()
 	predictor.eval()
-	return encoder, predictor, {key: torch.as_tensor(stats[key]).float() for key in (
+	return encoder, predictor, actor, {key: torch.as_tensor(stats[key]).float() for key in (
 		"state_mean", "state_std", "action_mean", "action_std", "action_low", "action_high"
 	)}
 
@@ -181,21 +166,26 @@ def _text(value):
 
 
 def load_subgoal_labels(path):
-	path = Path(path)
-	if not path.exists():
-		raise FileNotFoundError(
-			f"Manual subgoal labels not found: {path}. Run label_subgoals.py first."
-		)
-	with Path(path).open("r", encoding="utf-8") as stream:
-		data = json.load(stream)
-	if data.get("format_version") != 1 or not isinstance(data.get("labels"), dict):
-		raise ValueError(f"Unsupported subgoal label file format: {path}")
-	return data["labels"]
+	"""Read recorded grasp labels, not runtime simulator state or a manual JSON."""
+	labels = {}
+	with h5py.File(path, "r") as file:
+		for name, demo in file["data"].items():
+			count = len(demo["states"])
+			grasp = int(demo.attrs.get("grasp_index", -1))
+			if not 0 < grasp < count - 1:
+				raise ValueError(f"{name}: missing or invalid recorded grasp_index: {grasp}")
+			if "grasp_flags" in demo:
+				flags = np.asarray(demo["grasp_flags"], dtype=bool)
+				indices = np.flatnonzero(flags)
+				if flags.shape != (count,) or not len(indices) or int(indices[0]) != grasp:
+					raise ValueError(f"{name}: grasp_index disagrees with recorded grasp_flags")
+			labels[name] = {"grasp_frame": grasp, "goal_frame": count - 1, "num_frames": count}
+	return labels
 
 
 @torch.no_grad()
 def load_eval_bank(encoder, path, labels_path, device, stats, demo_name=None):
-	labels = load_subgoal_labels(labels_path)
+	labels = load_subgoal_labels(path)
 	entries = []
 	with h5py.File(path, "r") as file:
 		if _text(file["data"].attrs.get("env", "")) != ENV_NAME:
@@ -205,7 +195,7 @@ def load_eval_bank(encoder, path, labels_path, device, stats, demo_name=None):
 			print(f"WARNING: evals use MuJoCo {_text(version)}; inference uses {mujoco.__version__}")
 		if demo_name is not None:
 			if demo_name not in labels:
-				raise KeyError(f"{demo_name!r} has no manual grasp label in {labels_path}")
+				raise KeyError(f"{demo_name!r} has no recorded grasp label in {labels_path}")
 			names = [demo_name]
 		elif "mask/eval" in file:
 			all_names = [_text(value) for value in file["mask/eval"][:]]
@@ -216,7 +206,7 @@ def load_eval_bank(encoder, path, labels_path, device, stats, demo_name=None):
 		if not names:
 			raise ValueError(f"No labeled eval demos from {path} were found in {labels_path}")
 		if demo_name is None and len(names) != len(all_names):
-			print(f"using {len(names)}/{len(all_names)} eval demos with manual grasp labels")
+			print(f"using {len(names)}/{len(all_names)} eval demos with recorded grasp labels")
 		for name in names:
 			demo = file[f"data/{name}"]
 			num_frames = int(demo["states"].shape[0])
@@ -348,17 +338,7 @@ def run_rollout(
 				torch.stack(tuple(action_history))
 				if action_history else torch.empty(0, PREDICTOR_ACTION_DIM, device=device)
 			)
-			if stage["name"] == "lift":
-				gripper_schedules = held_gripper_schedule(planner, 1.0)
-			else:
-				gripper_schedules = planner.single_switch_gripper_schedules()
-			initial_mean = (
-				planner.shifted_plan(previous_plan)
-				if warm_start and previous_plan is not None else None
-			)
-			plan = planner.CEM(
-				zi, a, goal, initial_mean=initial_mean, gripper_schedules=gripper_schedules,
-			)
+			plan = planner.CEM(zi, a, goal)
 			previous_plan = plan
 			raw_blocks = planner.denormalize_action_blocks(plan)
 			# Execute one ordered 5-action block, then replan from observation.
@@ -414,116 +394,164 @@ def next_rollout_number(rollout_dir: Path) -> int:
 			latest = max(latest, int(match.group(1)))
 	return latest + 1
 
+def run_evaluation(run_dir, *, checkpoint_epoch=None, num_rollouts=50,
+                   eval_demo=None, seed=42, use_latent_thresholds=False,
+                   grasp_budget=150, lift_budget=100, grasp_threshold=.05,
+                   lift_threshold=.05, horizon=5, planner_mode='arcem',
+                   temperature=.2, samples=128, elites=16, iterations=3,
+                   device='cuda', evals=None):
+    PRIMARY_DIR = Path(run_dir)
+    MODEL_DIR = PRIMARY_DIR / 'models'
+    ROLLOUT_DIR = PRIMARY_DIR / 'rollouts'
+    ROLLOUT_DIR.mkdir(parents=True, exist_ok=True)
+    EVAL_HDF5 = Path(evals) if evals else PRIMARY_DIR / 'evals.hdf5'
+    SUBGOAL_LABELS = EVAL_HDF5  # Labels are embedded in the evaluation episodes.
+    for path in (EVAL_HDF5, SUBGOAL_LABELS):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    CHECKPOINT_EPOCH, NUM_ROLLOUTS, EVAL_DEMO = checkpoint_epoch, num_rollouts, eval_demo
+    EVAL_SEED, USE_LATENT_THRESHOLDS = seed, use_latent_thresholds
+    GRASP_BUDGET, LIFT_BUDGET = grasp_budget, lift_budget
+    GRASP_THRESHOLD, LIFT_THRESHOLD = grasp_threshold, lift_threshold
+    HORIZON, PLANNER_MODE, RESIDUAL_TEMPERATURE = horizon, planner_mode, temperature
+    NUM_SAMPLES, NUM_ELITES, CEM_ITERS, DEVICE = samples, elites, iterations, device
+    setup_simulator()
+    if DEVICE.startswith('cuda') and not torch.cuda.is_available():
+        raise RuntimeError('CUDA requested but unavailable; select --device cpu for diagnostics')
 
-def evaluate(args):
-	device = "cuda" if torch.cuda.is_available() else "cpu"
-	checkpoint = args.checkpoint or select_checkpoint(args.model_dir)
-	encoder, predictor, stats = load_models(checkpoint, device)
-	action_mean = stats["action_mean"].numpy()
-	action_std = stats["action_std"].numpy()
-	action_low = np.tile(((stats["action_low"] - stats["action_mean"]) / stats["action_std"]).numpy(), FRAME_SKIP)
-	action_high = np.tile(((stats["action_high"] - stats["action_mean"]) / stats["action_std"]).numpy(), FRAME_SKIP)
-	planner = Planner(
-		device, encoder, predictor, H=HORIZON, N=args.samples, K=args.elites, T=args.iterations,
-		action_dim=PREDICTOR_ACTION_DIM, primitive_action_dim=PRIMITIVE_ACTION_DIM,
-		action_low=action_low, action_high=action_high,
-		raw_action_mean=action_mean, raw_action_std=action_std,
-		min_std=0.05, momentum=0.1, seed=args.seed,
-		noise_correlation=args.noise_correlation, fresh_fraction=args.fresh_fraction,
-		separate_gripper_searches=not args.pooled_gripper_search,
-	)
-	entries = load_eval_bank(encoder, args.evals, args.labels, device, stats, args.demo)
-	entries.sort(key=lambda entry: int(re.fullmatch(r"demo_(\d+)", entry["name"]).group(1)))
-	if args.demo is None:
-		if args.rollouts > len(entries):
-			raise ValueError(f"Requested {args.rollouts} unique evals, but only {len(entries)} labeled demos are available")
-		indices = range(args.rollouts)
-	else:
-		indices = [0] * args.rollouts
-	stage_settings = {
-		"grasp": {
-			"budget": args.grasp_budget,
-			"threshold": args.grasp_threshold,
-			"use_threshold": not args.disable_thresholds,
-		},
-		"lift": {
-			"budget": args.lift_budget,
-			"threshold": args.lift_threshold,
-			"use_threshold": not args.disable_thresholds,
-		},
-	}
-	env = make_env(max(200, args.grasp_budget + args.lift_budget))
-	args.rollout_dir.mkdir(parents=True, exist_ok=True)
-	first_rollout_number = next_rollout_number(args.rollout_dir)
-	print(f"completed rollout videos found through #{first_rollout_number - 1}; starting at #{first_rollout_number}")
-	successes = 0
-	try:
-		for batch_index, index in enumerate(indices):
-			rollout_number = first_rollout_number + batch_index
-			entry = entries[int(index)]
-			pending = args.rollout_dir / f"rollout_{rollout_number}_pending.mp4"
-			pending.unlink(missing_ok=True)
-			writer = imageio.get_writer(str(pending), fps=CONTROL_FREQ, codec="libx264")
-			try:
-				success, steps = run_rollout(
-					env, planner, encoder, entry, device, stats, writer,
-					stage_settings,
-					warm_start=not args.no_warm_start,
-				)
-			finally:
-				writer.close()
-			result = pending.with_name(pending.name.replace("pending", "pass" if success else "fail"))
-			pending.replace(result)
-			successes += int(success)
-			print(
-				f"batch {batch_index + 1}/{args.rollouts} → rollout_{rollout_number}: "
-				f"{'pass' if success else 'fail'} ({steps} steps) -> {result}"
-			)
-	finally:
-		env.close()
-	print(f"success rate: {successes}/{args.rollouts} = {100*successes/args.rollouts:.1f}%")
+    if not isinstance(HORIZON, int) or isinstance(HORIZON, bool) or HORIZON < 1:
+        raise ValueError('HORIZON must be a positive integer number of 5-action blocks')
+    PLAN_STEPS = HORIZON * FRAME_SKIP
+    print(f'lookahead: {PLAN_STEPS} primitive steps; execute {FRAME_SKIP} before replanning')
 
+    if CHECKPOINT_EPOCH is None:
+        CHECKPOINT = select_checkpoint(MODEL_DIR)
+    else:
+        if not isinstance(CHECKPOINT_EPOCH, int) or isinstance(CHECKPOINT_EPOCH, bool) or CHECKPOINT_EPOCH < 0:
+            raise ValueError('CHECKPOINT_EPOCH must be a nonnegative integer or None')
+        CHECKPOINT = MODEL_DIR / f'epoch_{CHECKPOINT_EPOCH}_model.zip'
+        if not CHECKPOINT.exists():
+            raise FileNotFoundError(
+                f'Requested epoch {CHECKPOINT_EPOCH}, but checkpoint does not exist: {CHECKPOINT}'
+            )
+
+    # Reload every model-dependent object in this cell. This is important because
+    # goal embeddings from one encoder must never be reused with another epoch.
+    encoder, predictor, actor, STATS = load_models(CHECKPOINT, DEVICE)
+    print(f'checkpoint: {CHECKPOINT}')
+
+    for stage_name, budget, threshold in (
+        ('grasp', GRASP_BUDGET, GRASP_THRESHOLD),
+        ('lift', LIFT_BUDGET, LIFT_THRESHOLD),
+    ):
+        if budget < 1:
+            raise ValueError(f'{stage_name.upper()}_BUDGET must be positive')
+        if threshold < 0:
+            raise ValueError(f'{stage_name.upper()}_THRESHOLD must be nonnegative')
+        if budget % FRAME_SKIP:
+            raise ValueError(f'{stage_name.upper()}_BUDGET must be a multiple of {FRAME_SKIP}')
+
+    primitive_mean = STATS['action_mean'].numpy()
+    primitive_std = STATS['action_std'].numpy()
+    normalized_low = ((STATS['action_low'] - STATS['action_mean']) / STATS['action_std']).numpy()
+    normalized_high = ((STATS['action_high'] - STATS['action_mean']) / STATS['action_std']).numpy()
+    planner = ActorPlanner(
+        DEVICE, encoder, predictor, actor=actor, mode=PLANNER_MODE, temperature=RESIDUAL_TEMPERATURE,
+        H=HORIZON, N=NUM_SAMPLES, K=NUM_ELITES, T=CEM_ITERS,
+        action_dim=PREDICTOR_ACTION_DIM,
+        primitive_action_dim=PRIMITIVE_ACTION_DIM,
+        action_low=np.tile(normalized_low, FRAME_SKIP),
+        action_high=np.tile(normalized_high, FRAME_SKIP),
+        raw_action_mean=primitive_mean,
+        raw_action_std=primitive_std,
+        min_std=0.05,
+        momentum=0.1,
+        seed=EVAL_SEED,
+        noise_correlation=0.0, fresh_fraction=0.0, separate_gripper_searches=False,
+    )
+    entries = load_eval_bank(
+        encoder, EVAL_HDF5, SUBGOAL_LABELS, DEVICE, STATS, EVAL_DEMO
+    )
+    stage_settings = {
+        'grasp': {
+            'budget': GRASP_BUDGET,
+            'threshold': GRASP_THRESHOLD,
+            'use_threshold': USE_LATENT_THRESHOLDS,
+        },
+        'lift': {
+            'budget': LIFT_BUDGET,
+            'threshold': LIFT_THRESHOLD,
+            'use_threshold': USE_LATENT_THRESHOLDS,
+        },
+    }
+    entries.sort(key=lambda entry: int(re.fullmatch(r'demo_(\d+)', entry['name']).group(1)))
+    if not isinstance(NUM_ROLLOUTS, int) or isinstance(NUM_ROLLOUTS, bool) or NUM_ROLLOUTS < 1:
+        raise ValueError('NUM_ROLLOUTS must be a positive integer')
+    if EVAL_DEMO is None:
+        if NUM_ROLLOUTS > len(entries):
+            raise ValueError(f'Requested {NUM_ROLLOUTS} unique evals, but only {len(entries)} labeled demos are available')
+        indices = range(NUM_ROLLOUTS)
+    else:
+        indices = [0] * NUM_ROLLOUTS
+    print(f'Evaluating {NUM_ROLLOUTS} rollouts in demo order: {entries[indices[0]]["name"]} through {entries[indices[-1]]["name"]}')
+    env = make_env(max(200, GRASP_BUDGET + LIFT_BUDGET))
+
+    first_rollout_number = next_rollout_number(ROLLOUT_DIR)
+    print(
+        f'completed rollout videos found through #{first_rollout_number - 1}; '
+        f'starting at rollout_{first_rollout_number}'
+    )
+    successes = 0
+    started = time.perf_counter()
+    try:
+        for batch_index, index in enumerate(indices):
+            rollout_number = first_rollout_number + batch_index
+            entry = entries[int(index)]
+            pending = ROLLOUT_DIR / f'rollout_{rollout_number}_pending.mp4'
+            pending.unlink(missing_ok=True)
+            writer = imageio.get_writer(str(pending), fps=CONTROL_FREQ, codec='libx264')
+            try:
+                success, steps = run_rollout(
+                    env, planner, encoder, entry, DEVICE, STATS, writer, stage_settings,
+                    warm_start=False,
+                )
+            finally:
+                writer.close()
+            result = ROLLOUT_DIR / (
+                f"rollout_{rollout_number}_{'pass' if success else 'fail'}.mp4"
+            )
+            result.unlink(missing_ok=True)
+            pending.replace(result)
+            successes += int(success)
+            print(
+                f"batch {batch_index + 1}/{NUM_ROLLOUTS} → rollout_{rollout_number}: "
+                f"{'pass' if success else 'fail'} ({steps} steps, eval {entry['name']})"
+            )
+            print(f'video: {result}')
+    finally:
+        env.close()
+    print(f'success rate: {successes}/{NUM_ROLLOUTS} = {100*successes/NUM_ROLLOUTS:.1f}%')
+    print(f'total inference time: {time.perf_counter()-started:.2f}s')
+
+    return successes, NUM_ROLLOUTS
 
 def main():
-	parser = argparse.ArgumentParser(description=__doc__)
-	parser.add_argument("--model-dir", type=Path, default=ROOT / "models")
-	parser.add_argument("--checkpoint", type=Path)
-	parser.add_argument("--evals", type=Path, default=ROOT / "data/robot/mimicgen/evals.hdf5")
-	parser.add_argument(
-		"--labels", type=Path,
-		default=ROOT / "data/robot/mimicgen/subgoal_labels.json",
-	)
-	parser.add_argument("--rollout-dir", type=Path, default=ROOT / "rollouts")
-	parser.add_argument("--demo")
-	parser.add_argument("--rollouts", type=int, default=50)
-	parser.add_argument("--grasp-budget", type=int, default=200)
-	parser.add_argument("--grasp-threshold", type=float, default=0.05)
-	parser.add_argument("--lift-budget", type=int, default=100)
-	parser.add_argument("--lift-threshold", type=float, default=0.05)
-	parser.add_argument(
-		"--disable-thresholds", action="store_true", default=True,
-		help="Run each stage for its complete fixed budget; latent MSE is diagnostic only",
-	)
-	parser.add_argument("--enable-thresholds", dest="disable_thresholds", action="store_false")
-	parser.add_argument("--no-warm-start", action="store_true", help="Start each planning call from the action prior")
-	parser.add_argument("--noise-correlation", type=float, default=0.7, help="Primitive-step motion correlation; 0 disables smoothing")
-	parser.add_argument("--fresh-fraction", type=float, default=0.1, help="Fraction of broad recovery proposals per search group")
-	parser.add_argument("--pooled-gripper-search", action="store_true", help="Pool elites across gripper schedules instead of fitting each separately")
-	parser.add_argument("--samples", type=int, default=300)
-	parser.add_argument("--elites", type=int, default=30)
-	parser.add_argument("--iterations", type=int, default=10)
-	parser.add_argument("--seed", type=int, default=42)
-	args = parser.parse_args()
-	if args.rollouts < 1:
-		parser.error("--rollouts must be positive")
-	if min(args.grasp_budget, args.lift_budget) < 1:
-		parser.error("stage budgets must be positive")
-	if args.grasp_budget % FRAME_SKIP or args.lift_budget % FRAME_SKIP:
-		parser.error(f"stage budgets must be multiples of {FRAME_SKIP}")
-	if min(args.grasp_threshold, args.lift_threshold) < 0:
-		parser.error("stage thresholds must be nonnegative")
-	evaluate(args)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--run-dir', type=Path, default=ROOT / 'runs/primary_actor')
+    parser.add_argument('--checkpoint-epoch', type=int)
+    parser.add_argument('--num-rollouts', type=int, default=50)
+    parser.add_argument('--eval-demo')
+    parser.add_argument('--evals', type=Path)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--planner-mode', choices=('arcem','direct','cem'), default='arcem')
+    parser.add_argument('--use-latent-thresholds', action='store_true')
+    for name, default in [('grasp-budget',150), ('lift-budget',100), ('horizon',5),
+                          ('samples',128), ('elites',16), ('iterations',3)]:
+        parser.add_argument('--' + name, type=int, default=default)
+    for name, default in [('grasp-threshold',.05), ('lift-threshold',.05), ('temperature',.2)]:
+        parser.add_argument('--' + name, type=float, default=default)
+    run_evaluation(**vars(parser.parse_args()))
 
-
-if __name__ == "__main__":
-	main()
+if __name__ == '__main__':
+    main()

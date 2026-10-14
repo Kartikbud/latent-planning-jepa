@@ -1,54 +1,43 @@
-paths:
-  data_dir: data
-  log_dir: logs
-  save_dir: models
-
-training:
-  frame_skip: 5
-  lr: 5.0e-5
-  seed: 42
-  lambd: 0.1
-  epochs: 10
-  batch_size: 128
-  # Spawn clean readers instead of forking the process after h5py was used.
-  num_workers: 8
-  persistent_workers: false
-  pin_memory: true
-  prefetch_factor: 2
-  # Use PyTorch's conservative FIFO delivery path for long HDF5 runs.
-  in_order: true
-  loader_timeout: 120
-  loader_start_method: spawn
-  # Compiles the encoder and predictor on CUDA. The first batch is slower while
-  # graphs compile, then subsequent batches use the optimized graphs.
-  compile_model: true
-  # Clip rare unstable updates, and refresh BatchNorm statistics from a fixed
-  # amount of training data before validation and checkpointing.
-  gradient_clip_norm: 1.0
-  bn_calibration_batches: 256
-  window_size: 3
-  # auto: bf16 on Ampere+ (A100, L4, ...), fp16 on older CUDA (T4); or force bf16/fp16/off
-  amp_dtype: auto
-
-model:
-  embedding_dim: 192
-  action_dim: 7
-  pred_nheads: 16
-  dropout: 0.1
-  pred_nlayers: 6
-  pred_dim_head: 64
-  pred_mlp_dim: 2048
-  action_smoothing_dim: 10
-  projector_hidden_dim: 2048
-  patch_size: 14
-  enc_nheads: 3
-  enc_nlayers: 12
-  enc_npatches: 36
-
-loss:
-  knots: 17
-  num_proj: 1024
-
-optimizer:
-  betas: [0.9, 0.999]
-  weight_decay: 0.001
+{
+  "frame_skip": 5,
+  "lr": 5e-05,
+  "seed": 42,
+  "lambd": 0.1,
+  "epochs": 65,
+  "batch_size": 256,
+  "num_workers": 2,
+  "persistent_workers": false,
+  "pin_memory": true,
+  "prefetch_factor": 2,
+  "in_order": true,
+  "loader_timeout": 120,
+  "loader_start_method": "spawn",
+  "compile_model": true,
+  "window_size": 3,
+  "embedding_dim": 192,
+  "action_dim": 7,
+  "pred_nheads": 16,
+  "dropout": 0.1,
+  "pred_nlayers": 6,
+  "pred_dim_head": 64,
+  "pred_mlp_dim": 2048,
+  "action_smoothing_dim": 64,
+  "projector_hidden_dim": 2048,
+  "patch_size": 14,
+  "enc_nheads": 3,
+  "enc_nlayers": 12,
+  "enc_npatches": 36,
+  "knots": 17,
+  "num_proj": 1024,
+  "optimizer_betas": [
+    0.9,
+    0.999
+  ],
+  "optimizer_weight_decay": 0.001,
+  "gradient_clip_norm": 1.0,
+  "bn_calibration_batches": 256,
+  "amp_dtype": "auto",
+  "actor_weight": 0.1,
+  "student_probability": 0.5,
+  "history_dropout": 0.1
+}

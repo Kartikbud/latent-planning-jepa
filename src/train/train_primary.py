@@ -1,8 +1,25 @@
-import argparse
+"""Train the Lift actor + JEPA model; same training loop as the Colab notebook."""
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from src.architectures.robot_encoder import RobotEncoder
+from src.architectures.predictor import PredictorNetwork
+from src.architectures.actor import GoalActor, actor_objective
+from src.datasets.robot.actor_dataset import RobotActorDataset
+from src.datasets.robot.primary_dataset import (compute_train_state_stats,
+    compute_train_action_stats, normalize_robot_images)
+from src.losses import SIGReg
+from src.utils import resolve_amp_dtype, autocast_context, amp_dtype_label
+from src.train.actor_logging import start_actor_wandb, log_actor_epoch
+from src.primary_contract import (CHECKPOINT_FORMAT_VERSION, ARCHITECTURE_ID,
+    ACTION_ENCODING_ID, IMAGE_NORMALIZATION_ID)
+
 import inspect
+import math
 import re
 import shutil
-import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -13,28 +30,6 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
-
-SRC_DIR = Path(__file__).resolve().parents[1]
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from architectures.robot_encoder import RobotEncoder
-from architectures.predictor import PredictorNetwork
-from datasets.robot.primary_dataset import (
-    RobotPrimaryDataset,
-    compute_train_action_stats,
-    compute_train_state_stats,
-    normalize_robot_images,
-)
-from losses import SIGReg
-from primary_contract import (
-    ACTION_ENCODING_ID,
-    ARCHITECTURE_ID,
-    CHECKPOINT_FORMAT_VERSION,
-    IMAGE_NORMALIZATION_ID,
-)
-from utils import amp_dtype_label, autocast_context
-
 
 def load_config(config_path: Path) -> dict:
     with open(config_path) as f:
@@ -51,7 +46,7 @@ def _latest_epoch_checkpoint(save_dir: Path):
 
 
 def _load_training_state(
-    path: Path, encoder, predictor, optimizer, scaler, device, expected_metadata
+    path: Path, encoder, predictor, actor, optimizer, scaler, device, expected_metadata
 ):
     with zipfile.ZipFile(path, "r") as zf, tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -82,6 +77,8 @@ def _load_training_state(
             torch.load(tmp / "predictor_weights.pth", map_location=device, weights_only=True)
         )
 
+        zf.extract("actor_weights.pth", tmp)
+        actor.load_state_dict(torch.load(tmp / "actor_weights.pth", map_location=device, weights_only=True))
         try:
             optimizer.load_state_dict(training_state["optimizer"])
         except ValueError as exc:
@@ -99,6 +96,7 @@ def _save_checkpoint(
     zip_path: Path,
     encoder,
     predictor,
+    actor,
     optimizer,
     scaler,
     epoch: int,
@@ -123,6 +121,7 @@ def _save_checkpoint(
 
         torch.save(encoder.state_dict(), encoder_path)
         torch.save(predictor.state_dict(), predictor_path)
+        torch.save(actor.state_dict(), tmp / "actor_weights.pth")
         torch.save(
             {
                 "epoch": epoch,
@@ -154,13 +153,15 @@ def _save_checkpoint(
             state_stats_path,
         )
 
-        with zipfile.ZipFile(zip_path, "w") as zf:
+        with zipfile.ZipFile(tmp / "checkpoint.zip", "w") as zf:
+            zf.write(tmp / "actor_weights.pth", "actor_weights.pth")
             zf.write(encoder_path, "encoder_weights.pth")
             zf.write(predictor_path, "predictor_weights.pth")
             zf.write(training_path, "training_state.pth")
             zf.write(state_stats_path, "state_stats.pth")
             if config is not None:
                 zf.writestr("config.yaml", yaml.safe_dump(config, sort_keys=False))
+        _atomic_copy(tmp / "checkpoint.zip", zip_path)
 
 
 def _atomic_copy(source: Path, destination: Path):
@@ -264,7 +265,7 @@ def _recalibrate_batch_norm(
             )
             with autocast_context(device, amp_dtype):
                 embeddings = encoder(above, wrist, state)
-                predictor(embeddings[:, :-1], actions)
+                predictor(embeddings[:, :3], actions)
             batches_seen += 1
     finally:
         for module, momentum in zip(batch_norms, momenta):
@@ -310,7 +311,7 @@ def _loader_options(num_workers, persistent_workers, pin_memory,
 
 
 def _prepare_batch(batch, device, non_blocking):
-    above, wrist, state, actions = batch
+    above, wrist, state, actions = batch[:4]
     # Keep images as uint8 in workers and pinned host memory. Conversion on the
     # GPU cuts host memory and transfer traffic by 4x.
     above = above.to(device, non_blocking=non_blocking).float().mul_(1.0 / 255.0)
@@ -365,8 +366,25 @@ def train(device,
           bn_calibration_batches: int,
           amp_dtype: str,
           resume: bool = False,
-          config: dict | None = None):
+          config: dict | None = None,
+          actor_weight: float = 0.1,
+          student_probability: float = 0.5,
+          history_dropout: float = 0.1,
+          wandb_options: dict | None = None):
 
+    if not math.isfinite(actor_weight) or actor_weight <= 0:
+        raise ValueError('actor_weight must be finite and positive')
+    if not 0 <= student_probability <= 1 or not 0 <= history_dropout <= 1:
+        raise ValueError('Student forcing and history dropout must be probabilities')
+    if window_size != 3 or frame_skip != 5 or action_dim != 7:
+        raise ValueError('Actor dataset requires window=3, frame_skip=5, action_dim=7')
+    if action_smoothing_dim != 64:
+        raise ValueError('This training notebook requires action_smoothing_dim=64')
+    if resume:
+        if _latest_epoch_checkpoint(save_dir)[1] is None:
+            raise FileNotFoundError(f'No checkpoint to resume in {save_dir}')
+    elif any(save_dir.glob('*.zip')):
+        raise ValueError('Training checkpoints already exist; use RESUME=True or a new DRIVE_DIR')
     torch.manual_seed(seed)
     if isinstance(device, str):
         on_cuda = device.startswith("cuda")
@@ -384,7 +402,7 @@ def train(device,
 
     # Calculate these once from the train mask, then use the same values for
     # both splits and save them with every checkpoint.
-    h5_path = Path(data_dir) / "robot" / "mimicgen" / "demo.hdf5"
+    h5_path = Path(data_dir) / "robot" / "actor" / "demo_actor.hdf5"
     state_mean, state_std = compute_train_state_stats(h5_path)
     action_mean, action_std, action_low, action_high = compute_train_action_stats(h5_path)
     print(f"state mean: {state_mean.tolist()}")
@@ -396,7 +414,7 @@ def train(device,
         f"({frame_skip} simulator steps per model transition)"
     )
 
-    train_dataset = RobotPrimaryDataset(
+    train_dataset = RobotActorDataset(
         data_dir=data_dir,
         frame_skip=frame_skip,
         window=window_size,
@@ -406,7 +424,7 @@ def train(device,
         action_mean=action_mean,
         action_std=action_std,
     )
-    val_dataset = RobotPrimaryDataset(
+    val_dataset = RobotActorDataset(
         data_dir=data_dir,
         frame_skip=frame_skip,
         window=window_size,
@@ -426,6 +444,14 @@ def train(device,
         "frame_skip": frame_skip,
         "primitive_action_dim": action_dim,
         "predictor_action_dim": predictor_action_dim,
+        "action_smoothing_dim": action_smoothing_dim,
+        "initialization": "scratch",
+        "training_objective": "prediction_sigreg_goal_actor_nll_v1",
+        "actor_weight": float(actor_weight),
+        "student_probability": float(student_probability),
+        "history_dropout": float(history_dropout),
+        "actor_config": GoalActor(d_model=embedding_dim).config,
+        "dataset_revision": (config or {}).get("dataset_revision"),
     }
 
     loader_options = _loader_options(
@@ -477,6 +503,7 @@ def train(device,
         projector_hidden_dim=projector_hidden_dim,
     ).to(device)
 
+    actor = GoalActor(d_model=embedding_dim).to(device)
     gpu_name = torch.cuda.get_device_name(0) if on_cuda else "cpu"
     amp_label = amp_dtype_label(amp_dtype, device)
     print(f"networks are on device: {device} ({gpu_name})")
@@ -491,6 +518,7 @@ def train(device,
         (f"encoder.{name}", parameter)
         for name, parameter in encoder.named_parameters()
     ]
+    named_parameters += [(f"actor.{name}", p) for name, p in actor.named_parameters()]
     trainable_parameters = [
         parameter for _, parameter in named_parameters if parameter.requires_grad
     ]
@@ -511,321 +539,352 @@ def train(device,
     scaler = _make_grad_scaler(enabled=on_cuda and amp_label == "fp16")
 
     writer = SummaryWriter(log_dir=log_dir)
-    results = {
-        "train_loss": [],
-        "train_prediction_loss": [],
-        "train_sigreg_loss": [],
-        "train_grad_norm": [],
-        "val_loss": [],
-        "val_prediction_loss": [],
-        "val_sigreg_loss": [],
-        "encoder_bn_gamma_rms": [],
-        "encoder_bn_running_var_min": [],
-        "encoder_bn_running_var_max": [],
-    }
-    start_epoch = 0
-    best_val_loss = float("inf")
-    best_epoch = -1
+    wb_run = None
+    try:
+        results = {
+            "train_loss": [],
+            "train_prediction_loss": [],
+            "train_sigreg_loss": [],
+            "train_actor_nll": [],
+            "train_actor_mse": [],
+            "train_grad_norm": [],
+            "val_loss": [],
+            "val_prediction_loss": [],
+            "val_sigreg_loss": [],
+            "val_actor_nll": [],
+            "val_actor_mse": [],
+            "encoder_bn_gamma_rms": [],
+            "encoder_bn_running_var_min": [],
+            "encoder_bn_running_var_max": [],
+        }
+        saved_wandb = None
+        start_epoch = 0
+        best_val_loss = float("inf")
+        best_epoch = -1
 
-    if resume:
-        last_epoch, checkpoint_path = _latest_epoch_checkpoint(save_dir)
-        if checkpoint_path is None:
-            print(f"No epoch_*_model.zip found in {save_dir}; starting from scratch")
-        else:
-            training_state = _load_training_state(
-                checkpoint_path,
-                encoder,
-                predictor,
-                optimizer,
-                scaler,
-                device,
-                checkpoint_metadata,
-            )
-            if not training_state:
-                raise ValueError(
-                    f"{checkpoint_path} contains weights only and cannot resume "
-                    "optimizer state. Start a new run or use a new-format checkpoint."
+        if resume:
+            last_epoch, checkpoint_path = _latest_epoch_checkpoint(save_dir)
+            if checkpoint_path is None:
+                print(f"No epoch_*_model.zip found in {save_dir}; starting from scratch")
+            else:
+                training_state = _load_training_state(
+                    checkpoint_path,
+                    encoder,
+                    predictor,
+                    actor,
+                    optimizer,
+                    scaler,
+                    device,
+                    checkpoint_metadata,
                 )
-            saved_mean = training_state["state_mean"].cpu()
-            saved_std = training_state["state_std"].cpu()
-            if not torch.allclose(saved_mean, state_mean) or not torch.allclose(saved_std, state_std):
-                raise ValueError("Dataset state statistics do not match the checkpoint")
-            for key, current in (
-                ("action_mean", action_mean),
-                ("action_std", action_std),
-                ("action_low", action_low),
-                ("action_high", action_high),
-            ):
-                saved = training_state.get(key)
-                if saved is None or not torch.allclose(saved.cpu(), current):
-                    raise ValueError(f"Dataset {key} does not match the checkpoint")
-            results = training_state.get("results", results)
-            start_epoch = int(training_state.get("epoch", last_epoch)) + 1
-            previous_val_losses = results.get("val_loss", [])
-            best_val_loss = float(
-                training_state.get(
-                    "best_val_loss",
-                    min(previous_val_losses, default=float("inf")),
+                if not training_state:
+                    raise ValueError(
+                        f"{checkpoint_path} contains weights only and cannot resume "
+                        "optimizer state. Start a new run or use a new-format checkpoint."
+                    )
+                saved_mean = training_state["state_mean"].cpu()
+                saved_std = training_state["state_std"].cpu()
+                if not torch.allclose(saved_mean, state_mean) or not torch.allclose(saved_std, state_std):
+                    raise ValueError("Dataset state statistics do not match the checkpoint")
+                for key, current in (
+                    ("action_mean", action_mean),
+                    ("action_std", action_std),
+                    ("action_low", action_low),
+                    ("action_high", action_high),
+                ):
+                    saved = training_state.get(key)
+                    if saved is None or not torch.allclose(saved.cpu(), current):
+                        raise ValueError(f"Dataset {key} does not match the checkpoint")
+                saved_wandb = training_state.get("wandb_run")
+                results = training_state.get("results", results)
+                start_epoch = int(training_state.get("epoch", last_epoch)) + 1
+                previous_val_losses = results.get("val_loss", [])
+                best_val_loss = float(
+                    training_state.get(
+                        "best_val_loss",
+                        min(previous_val_losses, default=float("inf")),
+                    )
                 )
-            )
-            best_epoch = int(training_state.get("best_epoch", -1))
-            if best_epoch < 0 and previous_val_losses:
-                best_epoch = min(
-                    range(len(previous_val_losses)),
-                    key=previous_val_losses.__getitem__,
-                )
-            print(f"resumed {checkpoint_path.name}; continuing at epoch {start_epoch}")
+                best_epoch = int(training_state.get("best_epoch", -1))
+                if best_epoch < 0 and previous_val_losses:
+                    best_epoch = min(
+                        range(len(previous_val_losses)),
+                        key=previous_val_losses.__getitem__,
+                    )
+                print(f"resumed {checkpoint_path.name}; continuing at epoch {start_epoch}")
 
-    if compile_model and on_cuda:
-        if hasattr(encoder, "compile") and hasattr(predictor, "compile"):
-            encoder.compile()
-            predictor.compile()
-            print("torch.compile enabled for encoder and predictor")
-        else:
-            print("torch.compile requested but unavailable; using eager mode")
-
-    non_blocking = on_cuda and pin_memory
-
-    print(f"Training epochs [{start_epoch}, {start_epoch + epochs})")
-    for epoch in tqdm(range(start_epoch, start_epoch + epochs)):
-        print(f"Epoch: {epoch}\n------------")
-
-        train_metrics = torch.zeros(4, device=device)
-
-        encoder.train()
-        predictor.train()
-        for batch in train_dataloader:
-            above, wrist, state, actions = _prepare_batch(
-                batch, device, non_blocking
-            )
-
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context(device, amp_dtype):
-                # Encode o_t ... o_{t+window} once, then use the same shifted
-                # prediction objective as the original LeWM training process.
-                all_embeddings = encoder(above, wrist, state)
-                pred_embeddings = predictor(all_embeddings[:, :-1], actions)
-                target_embeddings = all_embeddings[:, 1:]
-
-                pred_loss = pred_loss_fn(pred_embeddings, target_embeddings)
-                reg_loss = sig_reg(all_embeddings.transpose(0, 1))
-                loss = pred_loss + lambd * reg_loss
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters,
-                max_norm=gradient_clip_norm,
-                error_if_nonfinite=True,
-            )
-            scaler.step(optimizer)
-            scaler.update()
-
-            train_metrics += torch.stack(
-                (
-                    loss.detach(),
-                    pred_loss.detach(),
-                    reg_loss.detach(),
-                    grad_norm.detach(),
-                )
-            )
-
-        num_train_batches = len(train_dataloader)
-        train_total, train_prediction, train_sigreg, train_grad_norm = (
-            train_metrics.div(num_train_batches).cpu().tolist()
+        wb_run = start_actor_wandb(
+            wandb_options, training_resume=resume, saved_run=saved_wandb,
+            output_dir=save_dir.parent,
+            config={**(config or {}), **checkpoint_metadata, "learning_rate": lr,
+                    "batch_size": batch_size, "sigreg_weight": lambd,
+                    "additional_epochs": epochs, "start_epoch": start_epoch,
+                    "num_workers": num_workers, "amp_dtype": amp_dtype},
         )
+        if wb_run is not None:
+            checkpoint_metadata["wandb_run"] = dict(
+                id=wb_run.id, project=wb_run.project, entity=wb_run.entity, name=wb_run.name)
+        elif saved_wandb:
+            checkpoint_metadata["wandb_run"] = saved_wandb
 
-        calibration_batches_seen = _recalibrate_batch_norm(
-            encoder=encoder,
-            predictor=predictor,
-            dataloader=train_dataloader,
-            max_batches=bn_calibration_batches,
-            device=device,
-            non_blocking=non_blocking,
-            amp_dtype=amp_dtype,
-        )
-        bn_gamma_rms, bn_var_min, bn_var_max = _batch_norm_diagnostics(encoder)
+        if compile_model and on_cuda:
+            if hasattr(encoder, "compile") and hasattr(predictor, "compile"):
+                encoder.compile()
+                predictor.compile()
+                print("torch.compile enabled for encoder and predictor")
+            else:
+                print("torch.compile requested but unavailable; using eager mode")
 
-        val_metrics = torch.zeros(3, device=device)
+        non_blocking = on_cuda and pin_memory
 
-        encoder.eval()
-        predictor.eval()
-        with torch.inference_mode():
-            for batch in val_dataloader:
+        print(f"Training epochs [{start_epoch}, {start_epoch + epochs})")
+        for epoch in tqdm(range(start_epoch, start_epoch + epochs)):
+            print(f"Epoch: {epoch}\n------------")
+
+            train_metrics = torch.zeros(6, device=device)
+
+            encoder.train()
+            predictor.train()
+            actor.train()
+            for batch in tqdm(train_dataloader, desc="Train batches", leave=False):
                 above, wrist, state, actions = _prepare_batch(
                     batch, device, non_blocking
                 )
 
+                optimizer.zero_grad(set_to_none=True)
                 with autocast_context(device, amp_dtype):
+                    # Encode o_t ... o_{t+window} once, then use the same shifted
+                    # prediction objective as the original LeWM training process.
                     all_embeddings = encoder(above, wrist, state)
-                    pred_embeddings = predictor(all_embeddings[:, :-1], actions)
-                    target_embeddings = all_embeddings[:, 1:]
+                    pred_embeddings = predictor(all_embeddings[:, :3], actions)
+                    target_embeddings = all_embeddings[:, 1:4]
 
                     pred_loss = pred_loss_fn(pred_embeddings, target_embeddings)
-                    reg_loss = sig_reg(all_embeddings.transpose(0, 1))
-                    loss = pred_loss + lambd * reg_loss
+                    reg_loss = sig_reg(all_embeddings[:, :4].transpose(0, 1))
+                    valid = batch[4].to(device, non_blocking=non_blocking)
+                    previous = actions[:, 1].reshape(-1, frame_skip, action_dim)
+                    # Match rollout initialization: no demonstration actions at reset.
+                    zero_history = (-action_mean.to(device) / action_std.to(device)).expand_as(previous)
+                    missing = torch.rand(previous.shape[0], 1, 1, device=device) < history_dropout
+                    previous = torch.where(missing, zero_history, previous)
+                    actor_loss, actor_mse = actor_objective(
+                        actor, all_embeddings[:, 2], all_embeddings[:, 4], previous,
+                        actions[:, 2].reshape(-1, frame_skip, action_dim), valid, student_probability
+                    )
+                    loss = pred_loss + lambd * reg_loss + actor_weight * actor_loss
 
-                val_metrics += torch.stack((loss, pred_loss, reg_loss))
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters,
+                    max_norm=gradient_clip_norm,
+                    error_if_nonfinite=True,
+                )
+                scaler.step(optimizer)
+                scaler.update()
 
-        num_val_batches = len(val_dataloader)
-        val_total, val_prediction, val_sigreg = (
-            val_metrics.div(num_val_batches).cpu().tolist()
-        )
+                train_metrics += torch.stack(
+                    (
+                        loss.detach(),
+                        pred_loss.detach(),
+                        reg_loss.detach(),
+                        actor_loss.detach(),
+                        actor_mse.detach(),
+                        grad_norm.detach(),
+                    )
+                )
 
-        results["train_loss"].append(train_total)
-        results["train_prediction_loss"].append(train_prediction)
-        results["train_sigreg_loss"].append(train_sigreg)
-        results.setdefault("train_grad_norm", []).append(train_grad_norm)
-        results["val_loss"].append(val_total)
-        results["val_prediction_loss"].append(val_prediction)
-        results["val_sigreg_loss"].append(val_sigreg)
-        results.setdefault("encoder_bn_gamma_rms", []).append(bn_gamma_rms)
-        results.setdefault("encoder_bn_running_var_min", []).append(bn_var_min)
-        results.setdefault("encoder_bn_running_var_max", []).append(bn_var_max)
+            num_train_batches = len(train_dataloader)
+            train_total, train_prediction, train_sigreg, train_actor, train_valid, train_grad_norm = (
+                train_metrics.div(num_train_batches).cpu().tolist()
+            )
 
-        writer.add_scalars(
-            main_tag="Loss/Total",
-            tag_scalar_dict={"train": train_total, "validation": val_total},
-            global_step=epoch,
-        )
-        writer.add_scalars(
-            main_tag="Loss/Prediction",
-            tag_scalar_dict={"train": train_prediction, "validation": val_prediction},
-            global_step=epoch,
-        )
-        writer.add_scalars(
-            main_tag="Loss/SIGReg",
-            tag_scalar_dict={"train": train_sigreg, "validation": val_sigreg},
-            global_step=epoch,
-        )
-        writer.add_scalar("Optimization/GradientNorm", train_grad_norm, epoch)
-        writer.add_scalar("BatchNorm/EncoderGammaRMS", bn_gamma_rms, epoch)
-        writer.add_scalar("BatchNorm/EncoderRunningVarMin", bn_var_min, epoch)
-        writer.add_scalar("BatchNorm/EncoderRunningVarMax", bn_var_max, epoch)
+            calibration_batches_seen = _recalibrate_batch_norm(
+                encoder=encoder,
+                predictor=predictor,
+                dataloader=train_dataloader,
+                max_batches=bn_calibration_batches,
+                device=device,
+                non_blocking=non_blocking,
+                amp_dtype=amp_dtype,
+            )
+            bn_gamma_rms, bn_var_min, bn_var_max = _batch_norm_diagnostics(encoder)
 
-        is_best = val_total < best_val_loss
-        if is_best:
-            best_val_loss = val_total
-            best_epoch = epoch
+            val_metrics = torch.zeros(5, device=device)
 
-        zip_path = save_dir / f"epoch_{epoch}_model.zip"
-        _save_checkpoint(
-            zip_path=zip_path,
-            encoder=encoder,
-            predictor=predictor,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            state_mean=state_mean,
-            state_std=state_std,
-            action_mean=action_mean,
-            action_std=action_std,
-            action_low=action_low,
-            action_high=action_high,
-            checkpoint_metadata=checkpoint_metadata,
-            results=results,
-            config=config,
-            best_val_loss=best_val_loss,
-            best_epoch=best_epoch,
-        )
-        if is_best:
-            _atomic_copy(zip_path, save_dir / "best_model.zip")
+            encoder.eval()
+            predictor.eval()
+            actor.eval()
+            with torch.inference_mode():
+                for batch in val_dataloader:
+                    above, wrist, state, actions = _prepare_batch(
+                        batch, device, non_blocking
+                    )
 
-        print(
-            f"Train total: {train_total:.4f} "
-            f"(prediction {train_prediction:.4f}, SIGReg {train_sigreg:.4f}) | "
-            f"Validation total: {val_total:.4f} "
-            f"(prediction {val_prediction:.4f}, SIGReg {val_sigreg:.4f}) | "
-            f"grad norm {train_grad_norm:.4f} | "
-            f"encoder BN gamma RMS {bn_gamma_rms:.4f} "
-            f"(recalibrated on {calibration_batches_seen} batches)"
-        )
-        if is_best:
-            print(f"new best validation checkpoint → {save_dir / 'best_model.zip'}")
+                    with autocast_context(device, amp_dtype):
+                        all_embeddings = encoder(above, wrist, state)
+                        pred_embeddings = predictor(all_embeddings[:, :3], actions)
+                        target_embeddings = all_embeddings[:, 1:4]
 
-    train_dataset.close()
-    val_dataset.close()
-    writer.close()
-    return results
+                        pred_loss = pred_loss_fn(pred_embeddings, target_embeddings)
+                        reg_loss = sig_reg(all_embeddings[:, :4].transpose(0, 1))
+                        valid = batch[4].to(device, non_blocking=non_blocking)
+                        actor_loss, actor_mse = actor_objective(
+                            actor, all_embeddings[:, 2], all_embeddings[:, 4],
+                            actions[:, 1].reshape(-1, frame_skip, action_dim),
+                            actions[:, 2].reshape(-1, frame_skip, action_dim), valid, 0.0
+                        )
+                        loss = pred_loss + lambd * reg_loss + actor_weight * actor_loss
+
+                    val_metrics += torch.stack((loss, pred_loss, reg_loss, actor_loss, actor_mse))
+
+            if not torch.isfinite(val_metrics).all():
+                raise FloatingPointError("Nonfinite validation losses; checkpoint not saved")
+            num_val_batches = len(val_dataloader)
+            val_total, val_prediction, val_sigreg, val_actor, val_valid = (
+                val_metrics.div(num_val_batches).cpu().tolist()
+            )
+
+            results["train_loss"].append(train_total)
+            results["train_prediction_loss"].append(train_prediction)
+            results["train_sigreg_loss"].append(train_sigreg)
+            results["train_actor_nll"].append(train_actor)
+            results["train_actor_mse"].append(train_valid)
+            results.setdefault("train_grad_norm", []).append(train_grad_norm)
+            results["val_loss"].append(val_total)
+            results["val_prediction_loss"].append(val_prediction)
+            results["val_sigreg_loss"].append(val_sigreg)
+            results["val_actor_nll"].append(val_actor)
+            results["val_actor_mse"].append(val_valid)
+            results.setdefault("encoder_bn_gamma_rms", []).append(bn_gamma_rms)
+            results.setdefault("encoder_bn_running_var_min", []).append(bn_var_min)
+            results.setdefault("encoder_bn_running_var_max", []).append(bn_var_max)
+
+            writer.add_scalars(
+                main_tag="Loss/Total",
+                tag_scalar_dict={"train": train_total, "validation": val_total},
+                global_step=epoch,
+            )
+            writer.add_scalars(
+                main_tag="Loss/Prediction",
+                tag_scalar_dict={"train": train_prediction, "validation": val_prediction},
+                global_step=epoch,
+            )
+            writer.add_scalars(
+                main_tag="Loss/SIGReg",
+                tag_scalar_dict={"train": train_sigreg, "validation": val_sigreg},
+                global_step=epoch,
+            )
+            writer.add_scalars(
+                main_tag="Loss/ActorNLL",
+                tag_scalar_dict={"train": train_actor, "validation": val_actor},
+                global_step=epoch,
+            )
+            writer.add_scalars(
+                main_tag="Loss/ActorMSE",
+                tag_scalar_dict={"train": train_valid, "validation": val_valid},
+                global_step=epoch,
+            )
+            writer.add_scalar("Optimization/GradientNorm", train_grad_norm, epoch)
+            writer.add_scalar("BatchNorm/EncoderGammaRMS", bn_gamma_rms, epoch)
+            writer.add_scalar("BatchNorm/EncoderRunningVarMin", bn_var_min, epoch)
+            writer.add_scalar("BatchNorm/EncoderRunningVarMax", bn_var_max, epoch)
+
+            is_best = val_total < best_val_loss
+            if is_best:
+                best_val_loss = val_total
+                best_epoch = epoch
+
+            zip_path = save_dir / f"epoch_{epoch}_model.zip"
+            _save_checkpoint(
+                zip_path=zip_path,
+                encoder=encoder,
+                predictor=predictor,
+                actor=actor,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                state_mean=state_mean,
+                state_std=state_std,
+                action_mean=action_mean,
+                action_std=action_std,
+                action_low=action_low,
+                action_high=action_high,
+                checkpoint_metadata=checkpoint_metadata,
+                results=results,
+                config=config,
+                best_val_loss=best_val_loss,
+                best_epoch=best_epoch,
+            )
+            if is_best:
+                _atomic_copy(zip_path, save_dir / "best_model.zip")
+            writer.flush()
+            log_actor_epoch(wb_run, epoch, results, best_epoch, best_val_loss, optimizer.param_groups[0]["lr"])
+
+            print(
+                f"Train total: {train_total:.4f} "
+                f"(prediction {train_prediction:.4f}, SIGReg {train_sigreg:.4f}, "
+                f"actor NLL {train_actor:.4f}) | "
+                f"Validation total: {val_total:.4f} "
+                f"(prediction {val_prediction:.4f}, SIGReg {val_sigreg:.4f}, "
+                f"actor NLL {val_actor:.4f}) | "
+                f"grad norm {train_grad_norm:.4f} | "
+                f"encoder BN gamma RMS {bn_gamma_rms:.4f} "
+                f"(recalibrated on {calibration_batches_seen} batches)"
+            )
+            if is_best:
+                print(f"new best validation checkpoint → {save_dir / 'best_model.zip'}")
+
+        return results
 
 
-if __name__ == "__main__":
-    PROJECT_DIR = Path(__file__).resolve().parents[2]
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=PROJECT_DIR / "configs" / "default_primary.yaml",
-        help="Path to the training config YAML file.",
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        required=True,
-        help="Name of the run. Checkpoints save to <save_dir>/<run_name>/.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume model, optimizer, and AMP state from the latest epoch checkpoint.",
-    )
+    finally:
+        train_dataset.close()
+        val_dataset.close()
+        writer.close()
+        if wb_run is not None:
+            import sys
+            wb_run.finish(exit_code=1 if sys.exc_info()[0] else 0)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=ROOT / 'configs/default_primary.yaml')
+    parser.add_argument('--data-dir', type=Path, default=ROOT / 'data', help='Contains robot/actor/demo_actor.hdf5')
+    parser.add_argument('--run-dir', type=Path, default=ROOT / 'runs/primary_actor')
+    parser.add_argument('--epochs', type=int, help='Additional epochs, also when resuming')
+    parser.add_argument('--batch-size', type=int)
+    parser.add_argument('--num-workers', type=int)
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--no-compile', action='store_true')
+    parser.add_argument('--wandb', action='store_true', help='Use saved local W&B login')
+    parser.add_argument('--wandb-project', default='primary_actor')
+    parser.add_argument('--wandb-name', default='primary_actor')
+    parser.add_argument('--wandb-mode', choices=('auto', 'new', 'resume'), default='auto')
+    parser.add_argument('--wandb-run-id')
+    parser.add_argument('--dataset-revision', default=None, help='HF commit SHA; keep identical on resume')
     args = parser.parse_args()
+    options = load_config(args.config)
+    for key in ('epochs', 'batch_size', 'num_workers'):
+        if getattr(args, key) is not None:
+            options[key] = getattr(args, key)
+    for key in ('epochs', 'batch_size'):
+        if options[key] < 1:
+            parser.error(f'{key} must be positive')
+    if args.no_compile:
+        options['compile_model'] = False
+    if not args.resume and any(p.exists() and any(p.iterdir()) for p in
+                               (args.run_dir / 'models', args.run_dir / 'logs')):
+        parser.error('Run directory already has models/logs. Use --resume or a new directory.')
+    train(device=args.device, data_dir=args.data_dir,
+          log_dir=args.run_dir / 'logs', save_dir=args.run_dir / 'models',
+          resume=args.resume, **options,
+          wandb_options=dict(enabled=args.wandb, project=args.wandb_project,
+              name=args.wandb_name, mode=args.wandb_mode, run_id=args.wandb_run_id),
+          config=dict(initialization='scratch', dataset_revision=args.dataset_revision,
+              run_dir=str(args.run_dir), **options))
 
-    config = load_config(args.config)
-
-    paths = config["paths"]
-    training = config["training"]
-    model = config["model"]
-    loss = config["loss"]
-    optimizer_cfg = config["optimizer"]
-
-    data_dir = PROJECT_DIR / paths["data_dir"]
-    log_dir = PROJECT_DIR / paths["log_dir"] / args.run_name
-    save_dir = PROJECT_DIR / paths["save_dir"] / args.run_name
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    results = train(
-        device=device,
-        data_dir=data_dir,
-        log_dir=log_dir,
-        save_dir=save_dir,
-        frame_skip=training["frame_skip"],
-        lr=training["lr"],
-        seed=training["seed"],
-        lambd=training["lambd"],
-        epochs=training["epochs"],
-        batch_size=training["batch_size"],
-        num_workers=training["num_workers"],
-        persistent_workers=training["persistent_workers"],
-        pin_memory=training["pin_memory"],
-        prefetch_factor=training.get("prefetch_factor", 2),
-        in_order=training.get("in_order", True),
-        loader_timeout=training.get("loader_timeout", 120),
-        loader_start_method=training.get("loader_start_method", "spawn"),
-        compile_model=training.get("compile_model", True),
-        window_size=training["window_size"],
-        embedding_dim=model["embedding_dim"],
-        action_dim=model["action_dim"],
-        pred_nheads=model["pred_nheads"],
-        dropout=model["dropout"],
-        pred_nlayers=model["pred_nlayers"],
-        pred_dim_head=model["pred_dim_head"],
-        pred_mlp_dim=model["pred_mlp_dim"],
-        action_smoothing_dim=model["action_smoothing_dim"],
-        projector_hidden_dim=model["projector_hidden_dim"],
-        patch_size=model["patch_size"],
-        enc_nheads=model["enc_nheads"],
-        enc_nlayers=model["enc_nlayers"],
-        enc_npatches=model["enc_npatches"],
-        knots=loss["knots"],
-        num_proj=loss["num_proj"],
-        optimizer_betas=tuple(optimizer_cfg["betas"]),
-        optimizer_weight_decay=optimizer_cfg["weight_decay"],
-        gradient_clip_norm=training.get("gradient_clip_norm", 1.0),
-        bn_calibration_batches=training.get("bn_calibration_batches", 256),
-        amp_dtype=training.get("amp_dtype", "auto"),
-        resume=args.resume,
-        config=config,
-    )
+if __name__ == '__main__':
+    main()

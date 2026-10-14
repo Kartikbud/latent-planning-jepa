@@ -113,8 +113,8 @@ def main():
     parser.add_argument(
         "--task",
         choices=TASKS,
-        default="stack",
-        help="Task to generate (default: stack)",
+        default="lift",
+        help="Task to generate (default: lift)",
     )
     args = parser.parse_args()
     task = TASKS[args.task]
