@@ -4,11 +4,11 @@
 
 Building on the JEPA-based latent world model introduced by Maes et al. (2026) in [*LeWorldModel*](https://arxiv.org/pdf/2603.19312), I extended the architecture to incorporate multi-view visual observations and robot proprioception. I then used the learned action-conditioned dynamics for latent-space planning, with a goal-conditioned actor seeding the MPC planner, forming a low-level controller for simulated lifting tasks.
 
-![JEPA architecture and training diagram](assets/jepa_architecture.png)
+![JEPA architecture and training diagram](assets/jepa_architecture.jpg)
 
 *Overview of the JEPA Architecture and Training*
 
-![MPC planner inference diagram](assets/mpc_planner.png)
+![MPC planner inference diagram](assets/mpc_planner.jpg)
 
 *Overview of the MPC Planner during inference*
 
