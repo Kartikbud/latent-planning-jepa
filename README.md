@@ -65,5 +65,3 @@ in [patches/README.md](patches/README.md).
 - **Train:** [train_primary.ipynb](notebooks/train_primary.ipynb) provides standalone Colab training with Hugging Face downloads and settings in the training cell.
 - **Evaluate:** [run_primary.ipynb](notebooks/run_primary.ipynb) provides Colab rollouts with Drive setup and planner controls included.
 - **Compute:** Experiments used an L4 GPU; slower GPUs increase planning latency.
-
-Legacy experiments are preserved on the `archive` branch; dependencies retain their upstream licenses.
